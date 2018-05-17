@@ -35,7 +35,9 @@ def is_unique_violation(ex):
     :param ex: Exception object
     :return: Boolean
     """
-    return isinstance(ex, ProgrammingError) and str(ex.orig.args[0]) == 'ERROR' and str(ex.orig.args[2]) == PG_UNIQUE_CONSTRAINT_VIOLATION_CODE
+    return isinstance(ex, ProgrammingError) and \
+           str(ex.orig.args[0]) == 'ERROR' and \
+           (str(ex.orig.args[2]) == PG_UNIQUE_CONSTRAINT_VIOLATION_CODE or str(ex.orig.args[1]) == PG_UNIQUE_CONSTRAINT_VIOLATION_CODE)
 
 
 def is_lock_acquisition_error(ex):
@@ -46,8 +48,12 @@ def is_lock_acquisition_error(ex):
     :return: Boolean
     """
 
-    return isinstance(ex, ProgrammingError) and str(ex.orig.args[0]) == 'ERROR' and str(ex.orig.args[2]) == PG_COULD_NOT_GET_ROWLOCK_CODE
+    return isinstance(ex, ProgrammingError) and \
+           str(ex.orig.args[0]) == 'ERROR' and \
+           (str(ex.orig.args[2]) == PG_COULD_NOT_GET_ROWLOCK_CODE or str(ex.orig.args[1]) == PG_COULD_NOT_GET_ROWLOCK_CODE)
 
 
 def is_table_not_found(ex):
-    return isinstance(ex, ProgrammingError) and str(ex.orig.args[0]) == 'ERROR' and str(ex.orig.args[2]) == PG_RELATION_NOT_FOUND_CODE
+    return isinstance(ex, ProgrammingError) and \
+           str(ex.orig.args[0]) == 'ERROR' and \
+           (str(ex.orig.args[2]) == PG_RELATION_NOT_FOUND_CODE or str(ex.orig.args[1]) == PG_RELATION_NOT_FOUND_CODE)
