@@ -22,9 +22,11 @@ module = None
 @click.option('--configfile', type=click.Path(exists=True))
 @click.option("--db-connect", nargs=1, required=True, help="DB connection string override.")
 @click.option("--db-use-ssl", is_flag=True, help="Set if DB connection is using SSL.")
-@click.option("--db-retries", nargs=1, default=1, help="If set, the tool will retry to connect to the DB the specified number of times at 5 second intervals.")
+@click.option("--db-retries", nargs=1, default=1, type=int, help="If set, the tool will retry to connect to the DB the specified number of times at 5 second intervals.")
+@click.option("--db-timeout", nargs=1, default=30, type=int, help="Number of seconds to wait for DB call to complete before timing out.")
+@click.option("--db-connect-timeout", nargs=1, default=120, type=int, help="Number of seconds to wait for initial DB connection before timing out.")
 @click.pass_obj
-def archivestorage(ctx_config , configfile, db_connect, db_use_ssl, db_retries):
+def archivestorage(ctx_config , configfile, db_connect, db_use_ssl, db_retries, db_timeout, db_connect_timeout):
     global config, localconfig
     config = ctx_config
 
@@ -47,12 +49,13 @@ def archivestorage(ctx_config , configfile, db_connect, db_use_ssl, db_retries):
             logger.set_log_level(log_level, log_to_stdout=True)
 
             # Use db connection from the config file
-            db_params = utils.connect_database(config, db_connect, db_use_ssl, db_retries=db_retries)
+            db_params = utils.make_db_params(db_connect=db_connect, db_use_ssl=db_use_ssl, db_timeout=db_timeout, db_connect_timeout=db_connect_timeout)
+            db_params = utils.connect_database(config, db_params, db_retries=db_retries)
         except Exception as err:
             raise err
 
     except Exception as err:
-        print utils.format_error_output(config, 'archivestorage', {}, err)
+        logger.error(utils.format_error_output(config, 'archivestorage', {}, err))
         sys.exit(2)
 
 
@@ -64,9 +67,9 @@ def list_drivers():
 
     try:
         drivers = archive.get_driver_list()
-        print "Supported convertable drivers: " + str(drivers)
+        logger.info("Supported convertable drivers: " + str(drivers))
     except Exception as err:
-        print utils.format_error_output(config, 'dbupgrade', {}, err)
+        logger.error(utils.format_error_output(config, 'dbupgrade', {}, err))
         if not ecode:
             ecode = 2
 
@@ -94,7 +97,7 @@ def check(configfile):
         service_config = None
 
     if not service_config:
-        logger.info('No configuration file or content available. Cannot test archive driver configuration')
+        logger.error('No configuration file or content available. Cannot test archive driver configuration')
         utils.doexit(2)
 
     archive.initialize(service_config)
@@ -109,30 +112,30 @@ def check(configfile):
     if archive.exists(test_user_id, test_bucket, test_archive_id):
         test_archive_id = 'cliconfigtest2'
         if archive.exists(test_user_id, test_bucket, test_archive_id):
-            logger.info('Found existing records for archive doc to test, aborting test to avoid overwritting any existing data')
+            logger.error('Found existing records for archive doc to test, aborting test to avoid overwritting any existing data')
             utils.doexit(1)
 
     logger.info('Creating test document with user_id = {}, bucket = {} and archive_id = {}'.format(test_user_id, test_bucket,
                                                                                              test_archive_id))
     result = archive.put(test_user_id, test_bucket, test_archive_id, data=test_data)
     if not result:
-        logger.info('Warning: Got empty response form archive PUT operation: {}'.format(result))
+        logger.warn('Warning: Got empty response form archive PUT operation: {}'.format(result))
 
     logger.info('Checking document fetch')
     loaded = archive.get(test_user_id, test_bucket, test_archive_id)
     if not loaded:
-        logger.info('Failed retrieving the written document. Got: {}'.format(loaded))
+        logger.error('Failed retrieving the written document. Got: {}'.format(loaded))
         utils.doexit(5)
 
     if str(loaded) != test_data:
-        logger.info('Failed retrieving the written document. Got something other than expected. Expected: "{}" Got: "{}"'.format(test_data, loaded))
+        logger.error('Failed retrieving the written document. Got something other than expected. Expected: "{}" Got: "{}"'.format(test_data, loaded))
         utils.doexit(5)
 
     logger.info('Removing test object')
     archive.delete(test_user_id, test_bucket, test_archive_id)
 
     if archive.exists(test_user_id, test_bucket, test_archive_id):
-        logger.info('Found archive object after it should have been removed')
+        logger.error('Found archive object after it should have been removed')
         utils.doexit(5)
 
     logger.info('Archive config check completed successfully')
@@ -192,11 +195,11 @@ def migrate(from_driver_configpath, to_driver_configpath, nodelete=False, dontas
             if 'archive_data_dir' in to_config:
                 logger.info("\tNOTE: for archive_data_dir, the value must be set to the location that is accessible within your anchore-engine container")
 
-            logger.info(yaml.dump(to_config, default_flow_style=False))
+            print (yaml.dump(to_config, default_flow_style=False))
         else:
             logger.info("Skipping conversion.")
     except Exception as err:
-        print utils.format_error_output(config, 'dbupgrade', {}, err)
+        logger.error(utils.format_error_output(config, 'dbupgrade', {}, err))
         if not ecode:
             ecode = 2
 

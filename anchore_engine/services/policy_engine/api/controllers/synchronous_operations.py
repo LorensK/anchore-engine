@@ -18,7 +18,7 @@ from anchore_engine.services.policy_engine.api.models import Image as ImageMsg, 
 from anchore_engine.services.policy_engine.api.models import ImageVulnerabilityListing, ImageIngressRequest, ImageIngressResponse, LegacyVulnerabilityReport, \
     GateSpec, TriggerParamSpec, TriggerSpec
 from anchore_engine.services.policy_engine.api.models import PolicyEvaluation, PolicyEvaluationProblem
-from anchore_engine.db import Image, get_thread_scoped_session as get_session
+from anchore_engine.db import Image, ImageCpe, CpeVulnerability, get_thread_scoped_session as get_session
 from anchore_engine.services.policy_engine.engine.policy.bundles import build_bundle, build_empty_error_execution
 from anchore_engine.services.policy_engine.engine.policy.exceptions import InitializationError
 from anchore_engine.services.policy_engine.engine.policy.gate import ExecutionContext, Gate
@@ -32,7 +32,7 @@ from anchore_engine.subsys import logger as log
 import anchore_engine.subsys.metrics
 from anchore_engine.subsys.metrics import flask_metrics
 
-TABLE_STYLE_HEADER_LIST = ['CVE_ID', 'Severity', '*Total_Affected', 'Vulnerable_Package', 'Fix_Available', 'Fix_Images', 'Rebuild_Images', 'URL']
+TABLE_STYLE_HEADER_LIST = ['CVE_ID', 'Severity', '*Total_Affected', 'Vulnerable_Package', 'Fix_Available', 'Fix_Images', 'Rebuild_Images', 'URL', 'Package_Type', 'Feed', 'Feed_Group', 'Package_Name', 'Package_Version']
 
 # Toggle of lock usage, primarily for testing and debugging usage
 feed_sync_locking_enabled = True
@@ -45,13 +45,8 @@ def get_status():
     """
     httpcode = 500
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'policy_engine'})
-        #return_object = {
-        #    'busy': False,
-        #    'up': True,
-        #    'message': 'all good'
-        #}
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
         return_object = str(err)
@@ -367,7 +362,12 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
                 str(vuln.fixed_in()),
                 vuln.pkg_image_id,
                 'None', # Always empty this for now
-                vuln.vulnerability.link
+                vuln.vulnerability.link,
+                vuln.pkg_type,
+                'vulnerabilities',
+                vuln.vulnerability.namespace_name,
+                vuln.pkg_name,
+                vuln.package.fullversion,
                 ]
             )
 
@@ -384,8 +384,31 @@ def get_image_vulnerabilities(user_id, image_id, force_refresh=False, vendor_onl
             }
         }
 
+        cpe_vuln_listing = []
+        try:
+            all_cpe_matches = db.query(ImageCpe,CpeVulnerability).filter(ImageCpe.image_id==image_id).filter(ImageCpe.name==CpeVulnerability.name).filter(ImageCpe.version==CpeVulnerability.version)
+            if not all_cpe_matches:
+                all_cpe_matches = []
+
+            for image_cpe, vulnerability_cpe in all_cpe_matches:
+                cpe_vuln_el = {
+                    'vulnerability_id': vulnerability_cpe.vulnerability_id,
+                    'severity': vulnerability_cpe.severity,
+                    'link': vulnerability_cpe.link,
+                    'pkg_type': image_cpe.pkg_type,
+                    'pkg_path': image_cpe.pkg_path,
+                    'name': image_cpe.name,
+                    'version': image_cpe.version,
+                    'cpe': image_cpe.get_cpestring(),
+                    'feed_name': vulnerability_cpe.feed_name,
+                    'feed_namespace': vulnerability_cpe.namespace_name,
+                }
+                cpe_vuln_listing.append(cpe_vuln_el)
+        except Exception as err:
+            log.warn("could not fetch CPE matches - exception: " + str(err))
+
         report = LegacyVulnerabilityReport.from_dict(vuln_listing)
-        resp = ImageVulnerabilityListing(user_id=user_id, image_id=image_id, legacy_report=report)
+        resp = ImageVulnerabilityListing(user_id=user_id, image_id=image_id, legacy_report=report, cpe_report=cpe_vuln_listing)
         return resp.to_dict()
     except HTTPException:
         db.rollback()

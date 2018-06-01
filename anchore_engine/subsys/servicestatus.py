@@ -8,12 +8,23 @@ import anchore_engine.configuration.localconfig
 import anchore_engine.version
 
 service_statuses = {}
+my_service_record = None
+
+def get_my_service_record():
+    global my_service_record
+    return(my_service_record)
+
+def set_my_service_record(service_record):
+    global my_service_record
+    my_service_record = service_record
+    return(True)
 
 def set_status(service_record, up=True, available=True, busy=False, message="all good", detail={}, update_db=False):
     global service_statuses
     hostid = service_record['hostid']
     servicename = service_record['servicename']
-    service = '__'.join([service_record['hostid'], service_record['servicename']])
+    base_url = service_record.get('base_url', 'N/A')
+    service = '__'.join([hostid, servicename, base_url])
 
     if service not in service_statuses:
         service_statuses[service] = {}
@@ -33,16 +44,19 @@ def set_status(service_record, up=True, available=True, busy=False, message="all
         update_status(service_record)
 
 def update_status(service_record):
-    global service_statuses
+    global service_statuses, my_service_record
     hostid = service_record['hostid']
     servicename = service_record['servicename']
-    service = '__'.join([service_record['hostid'], service_record['servicename']])
+    base_url = service_record.get('base_url', 'N/A')
+    service = '__'.join([hostid, servicename, base_url])
 
-    #timer = time.time()
     with session_scope() as dbsession:
-        my_service_record = db_services.get(hostid, servicename, session=dbsession)
-        my_service_record['heartbeat'] = time.time()
-        if my_service_record:
+        db_service_record = db_services.get(hostid, servicename, base_url, session=dbsession)
+        logger.debug("db service record: {}".format(db_service_record))
+        if db_service_record:
+            my_service_record = db_service_record
+            my_service_record['heartbeat'] = time.time()
+
             if service_statuses[service]['up'] and service_statuses[service]['available']:
                 my_service_record['status'] = True
             else:
@@ -51,34 +65,19 @@ def update_status(service_record):
             my_service_record['short_description'] = json.dumps(service_statuses[service])
             db_services.update_record(my_service_record, session=dbsession)
 
-    #anchore_engine.subsys.metrics.summary_observe('db_rw_probe', time.time() - timer)
-
     return(True)
 
 def get_status(service_record):
     global service_statuses
-    service = '__'.join([service_record['hostid'], service_record['servicename']])
+    hostid = service_record['hostid']
+    servicename = service_record['servicename']
+    base_url = service_record.get('base_url', 'N/A')
+    service = '__'.join([hostid, servicename, base_url])
 
     if service in service_statuses:
         ret = service_statuses[service]
     else:
         raise Exception("no service status set for service: " + str(service))
-    return(ret)
-
-def initialize_status(service_record, up=True, available=True, busy=False, message="all good", detail={}):
-    global service_statuses
-    service = '__'.join([service_record['hostid'], service_record['servicename']])
-    if service not in service_statuses:
-        set_status(service_record, up=up, available=available, busy=busy, message=message, detail=detail)
-    return(True)
-
-def has_status(service_record):
-    global service_statuses
-    service = '__'.join([service_record['hostid'], service_record['servicename']])
-    ret = False
-    if service in service_statuses:
-        ret = True
-
     return(ret)
 
 def handle_service_heartbeat(*args, **kwargs):
@@ -92,9 +91,12 @@ def handle_service_heartbeat(*args, **kwargs):
     while(True):
         logger.debug("storing service status: " + str(servicename))
         try:
-            service_record = {'hostid': localconfig['host_id'], 'servicename': servicename}
+            logger.debug("local service record: {}".format(anchore_engine.subsys.servicestatus.get_my_service_record()))
+            logger.debug("all service records: {}".format(service_statuses))
+
+            service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
             update_status(service_record)
-            logger.debug("service status stored: next in "+str(cycle_timer))
+            logger.debug("service status update stored: next in "+str(cycle_timer))
         except Exception as err:
             logger.error(str(err))
 

@@ -9,6 +9,7 @@ import hashlib
 import traceback
 import importlib
 import threading
+import base64
 
 #import simplejson as json
 from collections import OrderedDict
@@ -31,7 +32,7 @@ import anchore_engine.configuration.localconfig
 from anchore_engine import db
 from anchore_engine.auth.anchore_service import AnchorePasswordChecker
 from anchore_engine.db import db_services, db_users, session_scope
-from anchore_engine.subsys import logger, taskstate
+from anchore_engine.subsys import logger, taskstate, servicestatus
 from anchore_engine.services.policy_engine.api.models import ImageIngressRequest
 
 
@@ -40,7 +41,8 @@ resource_types = ['registries', 'users', 'images', 'policies', 'evaluations', 's
 bucket_types = ["analysis_data", "policy_bundles", "policy_evaluations", "query_data", "vulnerability_scan", "image_content_data", "manifest_data"]
 super_users = ['admin', 'anchore-system']
 image_content_types = ['os', 'files', 'npm', 'gem', 'python', 'java']
-image_vulnerability_types = ['os']
+image_metadata_types = ['manifest', 'docker_history', 'dockerfile']
+image_vulnerability_types = ['os', 'non-os']
 
 def update_image_record_with_analysis_data(image_record, image_data):
 
@@ -79,8 +81,9 @@ def update_image_record_with_analysis_data(image_record, image_data):
     if dockerfile_content and dockerfile_mode:
         image_record['dockerfile_mode'] = dockerfile_mode
         for image_detail in image_record['image_detail']:
-            image_detail['dockerfile'] = dockerfile_content.encode('base64')
             logger.debug("setting image_detail: ")
+            #image_detail['dockerfile'] = dockerfile_content.encode('base64')
+            image_detail['dockerfile'] = base64.b64encode(dockerfile_content)
 
     return(True)
 
@@ -165,24 +168,33 @@ def registerService(sname, config, enforce_unique=True):
         'short_description': ''
     }
 
-    if 'ssl_enable' in myconfig and myconfig['ssl_enable']:
+    #if 'ssl_enable' in myconfig and myconfig['ssl_enable']:
+    if myconfig.get('ssl_enable', False) or myconfig.get('external_tls', False):
         hstring = "https"
     else:
         hstring = "http"
 
     endpoint_hostname = endpoint_port = endpoint_hostport = None
 
-    if 'endpoint_hostname' in myconfig:
+    if myconfig.get('external_hostname', False):
+        endpoint_hostname = myconfig['external_hostname']
+    elif myconfig.get('endpoint_hostname', False):
         endpoint_hostname = myconfig['endpoint_hostname']
-        service_template['base_url'] = hstring + "://"+myconfig['endpoint_hostname']
-    if 'port' in myconfig:
-        endpoint_port = int(myconfig['port'])
-        service_template['base_url'] += ":"+ str(endpoint_port)
 
+    if myconfig.get('external_port', False):
+        endpoint_port = int(myconfig['external_port'])
+    elif myconfig.get('port', False):
+        endpoint_port = int(myconfig['port'])        
+    
     if endpoint_hostname:
         endpoint_hostport = endpoint_hostname
         if endpoint_port:
             endpoint_hostport = endpoint_hostport + ":" + str(endpoint_port)
+    
+    if endpoint_hostport:
+        service_template['base_url'] = "{}://{}".format(hstring, endpoint_hostport)
+    else:
+        raise Exception("could not construct service base_url - please check service configuration for hostname/port settings")
 
     try:
         service_template['status'] = False
@@ -200,16 +212,18 @@ def registerService(sname, config, enforce_unique=True):
                     if service_record and (service_record['hostid'] != config['host_id']):
                         raise Exception("service type ("+str(sname)+") already exists in system with different host_id - detail: my_host_id=" + str(config['host_id']) + " db_host_id=" + str(service_record['hostid']))
 
-            # in any case, check if another host is registered that has the same endpoint
-            #for service_record in service_records:
-            #    if service_record['base_url'] and service_record['base_url'] != 'N/A':
-            #        service_hostport = re.sub("^http.//", "", service_record['base_url'])
-            #        # if a different host_id has the same endpoint, fail
-            #        if (service_hostport == endpoint_hostport) and (config['host_id'] != service_record['hostid']):
-            #            raise Exception("trying to add new host but found conflicting endpoint from another host in DB - detail: my_host_id=" + str(config['host_id']) + " db_host_id="+str(service_record['hostid'])+" my_host_endpoint="+str(endpoint_hostport)+" db_host_endpoint="+str(service_hostport))
-
             # if all checks out, then add/update the registration
             ret = db_services.add(config['host_id'], sname, service_template, session=dbsession)
+
+            try:
+                my_service_record = {
+                    'hostid': config['host_id'],
+                    'servicename': sname,
+                }
+                my_service_record.update(service_template)
+                servicestatus.set_my_service_record(my_service_record)
+            except Exception as err:
+                logger.warn("could not set local service information - exception: {}".format(str(err)))
 
     except Exception as err:
         raise err
@@ -267,7 +281,7 @@ def initializeService(sname, config):
     return(True)
 
 # the anchore twistd plugins call this to initialize and make individual services
-def makeService(snames, options, db_connect=True, bootstrap_db=False, bootstrap_users=False, require_system_user_auth=True, module_name="anchore_engine.services", validate_params={}, specific_tables=None):
+def makeService(snames, options, db_connect=True, require_system_user_auth=True, module_name="anchore_engine.services", validate_params={}):
 
     try:
         logger.enable_bootstrap_logging(service_name=','.join(snames))
@@ -299,7 +313,7 @@ def makeService(snames, options, db_connect=True, bootstrap_db=False, bootstrap_
 
             # connect to DB
             try:
-                db.initialize(localconfig=localconfig, versions=versions, bootstrap_db=bootstrap_db, bootstrap_users=bootstrap_users, specific_tables=specific_tables)
+                db.initialize(localconfig=localconfig, versions=versions)
             except Exception as err:
                 logger.error("cannot connect to configured DB: exception - " + str(err))
                 raise err
@@ -820,7 +834,7 @@ def extract_dockerfile_content(image_data):
 
     return(dockerfile_content, dockerfile_mode)
 
-def extract_analyzer_content(image_data, content_type):
+def extract_analyzer_content(image_data, content_type, manifest=None):
     ret = {}
     try:
         idata = image_data[0]['image']
@@ -895,7 +909,27 @@ def extract_analyzer_content(image_data, content_type):
                     ret = {'anchore_image_report': image_data[0]['image']['imagedata']['image_report'], 'anchore_distro_meta': image_data[0]['image']['imagedata']['analysis_report']['analyzer_meta']['analyzer_meta']['base']}
             except Exception as err:
                 raise Exception("could not extract/parse content info - exception: " + str(err))
-            
+        elif content_type == 'manifest':
+            ret = {}
+            try:
+                if manifest:
+                    ret = json.loads(manifest)
+            except:
+                ret = {}
+        elif content_type == 'docker_history':
+            ret = []
+            try:
+                ret = idata.get('imagedata', {}).get('image_report', {}).get('docker_history', [])
+            except:
+                ret = []
+        elif content_type == 'dockerfile':
+            ret = ""
+            try:
+                if idata.get('imagedata', {}).get('image_report', {}).get('dockerfile_mode', "").lower() == 'actual':
+                    ret = idata.get('imagedata', {}).get('image_report', {}).get('dockerfile_contents', "")
+            except:
+                ret = ""
+
     except Exception as err:
         logger.warn("exception: " + str(err))
         raise err

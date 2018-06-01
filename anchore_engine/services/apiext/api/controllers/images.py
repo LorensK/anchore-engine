@@ -1,6 +1,7 @@
 import json
 import stat
 import datetime
+import base64
 
 from flask import request
 
@@ -16,7 +17,7 @@ from anchore_engine.subsys.metrics import flask_metrics
 def make_response_content(content_type, content_data):
     ret = []
 
-    if content_type not in anchore_engine.services.common.image_content_types:
+    if content_type not in anchore_engine.services.common.image_content_types + anchore_engine.services.common.image_metadata_types:
         logger.warn("input content_type ("+str(content_type)+") not supported ("+str(anchore_engine.services.common.image_content_types)+")")
         return(ret)
 
@@ -96,7 +97,6 @@ def make_response_content(content_type, content_data):
                 el['specification-version'] = content_data[package]['specification-version']
                 el['implementation-version'] = content_data[package]['implementation-version']
                 el['origin'] = content_data[package]['origin'] or 'Unknown'
-                #el['license'] = content_data[package]['license'] or 'Unknown'
             except:
                 el = {}
             if el:
@@ -120,7 +120,6 @@ def make_response_content(content_type, content_data):
                     try:
                         el[elmap[elkey]] = content_data[filename][elkey]
                     except:
-                        #el.pop(elmap[elkey], None)
                         el[elmap[elkey]] = None
 
                 # special formatting
@@ -128,18 +127,22 @@ def make_response_content(content_type, content_data):
                 if el['sha256'] == 'DIRECTORY_OR_OTHER':
                     el['sha256'] = None
 
-                #el['mode'] = oct(stat.S_IMODE(content_data[filename]['mode']))
-                #el['linkdest'] = content_data[filename]['linkdst']
-                #el['sha256'] = content_data[filename]['sha256']
-                #el['size'] = content_data[filename]['size']
-                #el['type'] = content_data[filename]['type']
-                #el['uid'] = content_data[filesname]['uid']
-                #el['gid'] = content_data[filesname]['gid']
-
             except Exception as err:
                 el = {}
             if el:
                 ret.append(el)        
+    elif content_type in ['docker_history']:
+        try:
+            ret = base64.b64encode(json.dumps(content_data))
+        except Exception as err:
+            logger.warn("could not convert content to json/base64 encode - exception: {}".format(err))
+            ret = ""
+    elif content_type in ['manifest', 'dockerfile']:
+        try:
+            ret = base64.b64encode(content_data)
+        except Exception as err:
+            logger.warn("could not base64 encode content - exception: {}".format(err))
+            ret = ""
     else:
         ret = content_data
 
@@ -152,13 +155,33 @@ def make_response_vulnerability(vulnerability_type, vulnerability_data):
         logger.warn("empty query data given to format - returning empty result")
         return (ret)
 
+    eltemplate = {
+        'vuln': 'None',
+        'severity': 'None',
+        'url': 'None',
+        'fix': 'None',
+        'package': 'None',
+        'package_name': 'None',
+        'package_version': 'None',
+        'package_type': 'None',
+        'package_cpe': 'None',
+        'package_path': 'None',
+        'feed': 'None',
+        'feed_group': 'None',
+    }
+
     if vulnerability_type == 'os':
         keymap = {
             'vuln': 'CVE_ID',
             'severity': 'Severity',
             'package': 'Vulnerable_Package',
             'fix': 'Fix_Available',
-            'url': 'URL'
+            'url': 'URL',
+            'package_type': 'Package_Type',
+            'feed': 'Feed',
+            'feed_group': 'Feed_Group',
+            'package_name': 'Package_Name',
+            'package_version': 'Package_Version',
         }
         scan_result = vulnerability_data['legacy_report']
         try:
@@ -167,141 +190,47 @@ def make_response_vulnerability(vulnerability_type, vulnerability_data):
                 rows = scan_result[imageId]['result']['rows']
                 for row in rows:
                     el = {}
+                    el.update(eltemplate)
                     for k in keymap.keys():
                         try:
                             el[k] = row[header.index(keymap[k])]
                         except:
-                            el[k] = None
+                            el[k] = 'None'
 
                         # conversions
                         if el[k] == 'N/A':
-                            el[k] = None
+                            el[k] = 'None'
 
                     ret.append(el)
         except Exception as err:
             logger.warn("could not prepare query response - exception: " + str(err))
             ret = []
+    elif vulnerability_type == 'non-os':
+        keymap = {
+            'vuln': 'vulnerability_id',
+            'severity': 'severity',
+            'package_name': 'name',
+            'package_version': 'version',
+            'package_path': 'pkg_path',
+            'package_type': 'pkg_type',
+            'package_cpe': 'cpe',
+            'url': 'link',
+            'feed': 'feed_name',
+            'feed_group': 'feed_namespace',
+        }
+        scan_result = vulnerability_data['cpe_report']
+        for vuln in scan_result:
+            el = {}
+            el.update(eltemplate)
+
+            for k in keymap.keys():
+                el[k] = vuln[keymap[k]]
+
+            el['package'] = "{}-{}".format(vuln['name'], vuln['version'])
+
+            ret.append(el)
     else:
         ret = vulnerability_data
-
-    return (ret)
-
-def make_response_query_orig(queryType, query_data):
-    ret = []
-
-    if not query_data:
-        logger.warn("empty query data given to format - returning empty result")
-        return (ret)
-
-    if queryType == 'cve-scan':
-        keymap = {
-            'vuln': 'CVE_ID',
-            'severity': 'Severity',
-            'package': 'Vulnerable_Package',
-            'fix': 'Fix_Available',
-            'url': 'URL'
-        }
-        scan_result = query_data['legacy_report']
-        try:
-            for imageId in scan_result.keys():
-                header = scan_result[imageId]['result']['header']
-                rows = scan_result[imageId]['result']['rows']
-                for row in rows:
-                    el = {}
-                    for k in keymap.keys():
-                        try:
-                            el[k] = row[header.index(keymap[k])]
-                        except:
-                            el[k] = None
-
-                        # conversions
-                        if el[k] == 'N/A':
-                            el[k] = None
-
-                    ret.append(el)
-        except Exception as err:
-            logger.warn("could not prepare query response - exception: " + str(err))
-            ret = []
-
-    elif queryType in ['list-package-detail', 'list-npm-detail', 'list-gem-detail']:
-        keymap = {
-            'package': 'Package_Name',
-            'type': 'Type',
-            'size': 'Size',
-            'version': 'Version',
-            'origin': 'Origin',
-            'license': 'License',
-            'location': 'Location'
-        }
-
-        try:
-            for imageId in query_data.keys():
-                header = query_data[imageId]['result']['header']
-                rows = query_data[imageId]['result']['rows']
-                for row in rows:
-                    el = {}
-                    for k in keymap.keys():
-                        try:
-                            el[k] = row[header.index(keymap[k])]
-                        except:
-                            el[k] = None
-
-                        # conversions
-                        if el[k] == 'N/A':
-                            el[k] = None
-                        elif k == 'size':
-                            try:
-                                el[k] = int(el[k])
-                            except:
-                                el[k] = None
-                        elif k == 'type' and not el[k]:
-                            if queryType == 'list-npm-detail':
-                                el[k] = 'NPM'
-                            elif queryType == 'list-gem-detail':
-                                el[k] = 'GEM'
-                    if queryType == 'list-package-detail' and 'location' in el:
-                        el.pop('location', None)
-                    ret.append(el)
-        except Exception as err:
-            logger.warn("could not prepare query response - exception: " + str(err))
-            ret = []
-
-    elif queryType == 'list-files-detail':
-        keymap = {
-            'filename': 'Filename',
-            'type': 'Type',
-            'size': 'Size',
-            'mode': 'Mode',
-            'sha256': 'Checksum',
-            'linkdest': 'Link_Dest'
-        }
-
-        try:
-            for imageId in query_data.keys():
-                header = query_data[imageId]['result']['header']
-                rows = query_data[imageId]['result']['rows']
-                for row in rows:
-                    el = {}
-                    for k in keymap.keys():
-                        try:
-                            el[k] = row[header.index(keymap[k])]
-                        except:
-                            el[k] = None
-
-                        # conversions
-                        if el[k] == 'N/A':
-                            el[k] = None
-                        elif el[k] == 'DIRECTORY_OR_OTHER':
-                            el[k] = None
-                        elif k == 'size':
-                            el[k] = int(el[k])
-
-                    ret.append(el)
-        except Exception as err:
-            logger.warn("could not prepare query response - exception: " + str(err))
-            ret = []
-    else:
-        ret = query_data
 
     return (ret)
 
@@ -332,7 +261,7 @@ def make_response_policyeval(user_auth, eval_record, params):
             else:
                 ret[tag]['status'] = 'fail'
 
-            ret[tag]['last_evaluation'] = datetime.datetime.fromtimestamp(eval_record['created_at']).isoformat()
+            ret[tag]['last_evaluation'] = datetime.datetime.utcfromtimestamp(eval_record['created_at']).isoformat() + 'Z'
 
         else:
             ret[tag]['policyId'] = "N/A"
@@ -377,28 +306,20 @@ def make_response_image(user_auth, image_record, params={}):
             for removekey in ['record_state_val', 'record_state_key']:
                 image_detail.pop(removekey, None)
 
-            for datekey in ['last_updated', 'created_at']:
+            for datekey in ['last_updated', 'created_at', 'tag_detected_at']:
                 try:
-                    image_detail[datekey] = datetime.datetime.utcfromtimestamp(image_detail[datekey]).isoformat()
+                    image_detail[datekey] = datetime.datetime.utcfromtimestamp(image_detail[datekey]).isoformat() + 'Z'
                 except:
                     pass
 
     if params and 'detail' in params and not params['detail']:
         image_record['image_detail'] = []
 
-    for datekey in ['last_updated', 'created_at']:
+    for datekey in ['last_updated', 'created_at', 'analyzed_at']:
         try:
-            image_record[datekey] = datetime.datetime.utcfromtimestamp(image_record[datekey]).isoformat()
+            image_record[datekey] = datetime.datetime.utcfromtimestamp(image_record[datekey]).isoformat() +'Z'
         except:
             pass
-
-    #image_content_metadata = {}
-    #try:
-    #    image_content_metadata = get_image_summary(user_auth, image_record)
-    #except:
-    #    image_content_metadata = {}
-    #ret['image_content'] = {}
-    #ret['image_content']['metadata'] = image_content_metadata
 
     for removekey in ['record_state_val', 'record_state_key']:
         image_record.pop(removekey, None)
@@ -464,7 +385,7 @@ def vulnerability_query(request_inputs, vulnerability_type, doformat=False):
     vendor_only = params.get('vendor_only', True)
 
     try:
-        if vulnerability_type not in anchore_engine.services.common.image_vulnerability_types:
+        if vulnerability_type not in anchore_engine.services.common.image_vulnerability_types + ['all']:
             httpcode = 404
             raise Exception("content type ("+str(vulnerability_type)+") not available")
 
@@ -479,17 +400,21 @@ def vulnerability_query(request_inputs, vulnerability_type, doformat=False):
                 raise Exception("image is not analyzed - analysis_status: " + image_report['analysis_status'])
             imageDigest = image_report['imageDigest']
             try:
-                if vulnerability_type == 'os':
-                    image_detail = image_report['image_detail'][0]
-                    imageId = image_detail['imageId']
-                    client = anchore_engine.clients.policy_engine.get_client(user=system_user_auth[0], password=system_user_auth[1], verify_ssl=verify)
-                    resp = client.get_image_vulnerabilities(user_id=userId, image_id=imageId, force_refresh=force_refresh, vendor_only=vendor_only)
-                    if doformat:
-                        return_object[imageDigest] = make_response_vulnerability(vulnerability_type, resp.to_dict())
+                image_detail = image_report['image_detail'][0]
+                imageId = image_detail['imageId']
+                client = anchore_engine.clients.policy_engine.get_client(user=system_user_auth[0], password=system_user_auth[1], verify_ssl=verify)
+                resp = client.get_image_vulnerabilities(user_id=userId, image_id=imageId, force_refresh=force_refresh, vendor_only=vendor_only)
+                if doformat:
+                    if vulnerability_type == 'all':
+                        ret = []
+                        for vtype in anchore_engine.services.common.image_vulnerability_types:
+                            ret = ret + make_response_vulnerability(vtype, resp.to_dict())
+                            #return_object[imageDigest] = make_response_vulnerability(vulnerability_type, resp.to_dict())
                     else:
-                        return_object[imageDigest] = resp.to_dict()
+                        ret = make_response_vulnerability(vulnerability_type, resp.to_dict())
+                    return_object[imageDigest] = ret
                 else:
-                    return_object[imageDigest] = []
+                    return_object[imageDigest] = resp.to_dict()
 
                 httpcode = 200
             except Exception as err:
@@ -513,7 +438,7 @@ def get_content(request_inputs, content_type, doformat=False):
     httpcode = 500
     userId, pw = user_auth
     try:
-        if content_type not in anchore_engine.services.common.image_content_types:
+        if content_type not in anchore_engine.services.common.image_content_types + anchore_engine.services.common.image_metadata_types:
             httpcode = 404
             raise Exception("content type ("+str(content_type)+") not available")
 
@@ -529,14 +454,24 @@ def get_content(request_inputs, content_type, doformat=False):
 
             imageDigest = image_report['imageDigest']
 
-            try:
-                image_content_data = catalog.get_document(user_auth, 'image_content_data', imageDigest)
-            except Exception as err:
-                raise anchore_engine.services.common.make_anchore_exception(err, input_message="cannot fetch content data from archive", input_httpcode=500)
+            if content_type == 'manifest':
+                try:
+                    image_manifest_data = catalog.get_document(user_auth, 'manifest_data', imageDigest)
+                except Exception as err:
+                    raise anchore_engine.services.common.make_anchore_exception(err, input_message="cannot fetch content data {} from archive".format(content_type), input_httpcode=500)
 
-            if content_type not in image_content_data:
-                httpcode = 404
-                raise Exception("image content of type ("+str(content_type)+") was not an available type at analysis time for this image")
+                image_content_data = {
+                    'manifest': image_manifest_data
+                }
+            else:
+                try:
+                    image_content_data = catalog.get_document(user_auth, 'image_content_data', imageDigest)
+                except Exception as err:
+                    raise anchore_engine.services.common.make_anchore_exception(err, input_message="cannot fetch content data from archive", input_httpcode=500)
+
+                if content_type not in image_content_data:
+                    httpcode = 404
+                    raise Exception("image content of type ("+str(content_type)+") was not an available type at analysis time for this image")
 
             return_object[imageDigest] = make_response_content(content_type, image_content_data[content_type])
 
@@ -626,7 +561,7 @@ def list_imagetags():
     return return_object, httpcode    
 
 
-def list_images(history=None, image_to_get=None):
+def list_images(history=None, image_to_get=None, fulltag=None):
 
     try:
         request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'history': False})
@@ -734,6 +669,36 @@ def get_image_policy_check_by_imageId(imageId, policyId=None, tag=None, detail=N
     return return_object, httpcode
 
 
+def list_image_metadata(imageDigest):
+    try:
+        return_object = anchore_engine.services.common.image_metadata_types
+        httpcode = 200
+    except Exception as err:
+        httpcode = 500
+        return_object = str(err)
+
+    return return_object, httpcode
+
+@flask_metrics.do_not_track()
+def get_image_metadata_by_type(imageDigest, mtype):
+    try:
+        request_inputs = anchore_engine.services.common.do_request_prep(request, default_params={'imageDigest':imageDigest})
+
+        return_object, httpcode = get_content(request_inputs, mtype, doformat=True)
+        if httpcode == 200:
+            return_object = {
+                'imageDigest': imageDigest,
+                'metadata_type': mtype,
+                'metadata': return_object.values()[0]
+            }
+
+    except Exception as err:
+        httpcode = 500
+        return_object = str(err)
+    
+    return return_object, httpcode
+
+
 def list_image_content(imageDigest):
     try:
         return_object = anchore_engine.services.common.image_content_types
@@ -794,7 +759,7 @@ def get_image_content_by_type_imageId(imageId, ctype):
 @flask_metrics.do_not_track()
 def get_image_vulnerability_types(imageDigest):
     try:
-        return_object = anchore_engine.services.common.image_vulnerability_types
+        return_object = anchore_engine.services.common.image_vulnerability_types + ['all']
         httpcode = 200
 
     except Exception as err:
@@ -906,19 +871,25 @@ def images(request_inputs):
     httpcode = 500
 
     userId, pw = user_auth
-    digest = tag = imageId = imageDigest = dockerfile = annotations = None
+    fulltag = digest = tag = imageId = imageDigest = dockerfile = annotations = None
 
     history = False
-    if params and 'history' in params:
-        history = params['history']
-
     force = False
-    if params and 'force' in params:
-        force = params['force']
-
     autosubscribe = True
-    if params and 'autosubscribe' in params:
-        autosubscribe = params['autosubscribe']
+    query_fulltag = None
+
+    if params:
+        if 'history' in params:
+            history = params['history']
+
+        if 'force' in params:
+            force = params['force']
+
+        if 'autosubscribe' in params:
+            autosubscribe = params['autosubscribe']
+
+        if 'fulltag' in params:
+            query_fulltag = params['fulltag']
 
     if bodycontent:
         jsondata = json.loads(bodycontent)
@@ -947,6 +918,12 @@ def images(request_inputs):
             logger.debug("handling GET: ")
             try:
                 return_object = []
+
+                # Query param fulltag has precedence for search
+                if query_fulltag:
+                    tag = query_fulltag
+                    imageId = imageDigest = digest = None
+
                 image_records = catalog.get_image(user_auth, digest=digest, tag=tag, imageId=imageId,
                                                           imageDigest=imageDigest, history=history)
                 for image_record in image_records:
@@ -1134,7 +1111,7 @@ def images_check_impl(request_inputs, image_records):
 
                     try:
                         if params and 'history' in params and params['history']:
-                            results = catalog.get_eval(user_auth, imageDigest=imageDigest, tag=tag,
+                            results = catalog.get_evals(user_auth, imageDigest=imageDigest, tag=tag,
                                                                policyId=policyId)
                         else:
                             results = [catalog.get_eval_latest(user_auth, imageDigest=imageDigest, tag=tag,

@@ -17,4 +17,3 @@ from .deprecated import *
 
 # Bring in eol'd gates
 from .eol import *
-

@@ -39,7 +39,7 @@ def make_response_prune_candidate(user_auth, prune_record, params):
     try:
         for k in ['reason', 'resourcetype', 'userId']:
             ret[k] = prune_record[k]
-        ret['created_at'] = datetime.datetime.fromtimestamp(prune_record['created_at']).isoformat()
+        ret['created_at'] = datetime.datetime.utcfromtimestamp(prune_record['created_at']).isoformat() + 'Z'
 
         ret['resource_ids'] = {}
         if 'resource_ids' in prune_record:
@@ -71,8 +71,8 @@ def get_status():
     httpcode = 500
 
     try:
-        localconfig = anchore_engine.configuration.localconfig.get_config()
-        return_object = anchore_engine.subsys.servicestatus.get_status({'hostid': localconfig['host_id'], 'servicename': 'apiext'})
+        service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
+        return_object = anchore_engine.subsys.servicestatus.get_status(service_record)
         httpcode = 200
     except Exception as err:
         return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)

@@ -157,7 +157,6 @@ class Oauth2AuthenticatedClient(object):
 
         :return: Dict of user metadata
         """
-
         user_url = self.anchore_auth['client_info_url'] + '/' + self.anchore_auth['username']
         user_timeout = 60
         retries = 3
@@ -562,6 +561,7 @@ def get_client(feeds_url=None, token_url=None, client_url=None, user=tuple(), co
         user = conf.get('feeds', {}).get('anonymous_user_username')
         password = conf.get('feeds', {}).get('anonymous_user_password')
 
+    logger.debug("using values: " + str([feeds_url, token_url, client_url, user, conn_timeout, read_timeout]))
     # TODO need a better way to select which client to return, here
     if token_url and client_url:
         return AnchoreIOFeedClient(feed_url=feeds_url, token_url=token_url, client_url=client_url, username=user, password=password, connect_timeout=conn_timeout, read_timeout=read_timeout)

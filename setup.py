@@ -22,7 +22,7 @@ for root, dirnames, filenames in os.walk('./'+package_name):
 package_data = {
     package_name: [
         'conf/*',
-        #'twisted/plugins/*',
+        'analyzers/modules/*',
     ] + swaggers,
     'twisted':  ['plugins/*']
 }

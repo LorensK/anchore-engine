@@ -3,12 +3,37 @@ import json
 import re
 
 from anchore_engine.db import DistroNamespace
-from anchore_engine.db import Image, ImagePackage, FilesystemAnalysis, ImageNpm, ImageGem, AnalysisArtifact, ImagePackageManifestEntry
+from anchore_engine.db import Image, ImagePackage, FilesystemAnalysis, ImageNpm, ImageGem, AnalysisArtifact, ImagePackageManifestEntry, ImageCpe
 from .logs import get_logger
 from .util.rpm import split_rpm_filename
 
 log = get_logger()
 
+# this is a static mapping of known package names (keys) to official cpe names for each package
+nomatch_inclusions = {
+    'java': {
+        'springframework': ['spring_framework', 'springsource_spring_framework'],
+    },
+    'npm': {
+        'hapi': ['hapi_server_framework'],
+        'handlebars.js': ['handlebars'],
+        'is-my-json-valid': ['is_my_json_valid'],
+        'mustache': ['mustache.js'],
+    },
+    'gem': {
+        'Arabic-Prawn': ['arabic_prawn'],
+        'bio-basespace-sdk': ['basespace_ruby_sdk'],
+        'cremefraiche': ['creme_fraiche'],
+        'html-sanitizer': ['html_sanitizer'],
+        'sentry-raven': ['raven-ruby'],
+        'RedCloth': ['redcloth_library'],
+        'VladTheEnterprising': ['vladtheenterprising'],
+        'yajl-ruby': ['yajl-ruby_gem'],
+    },
+    'python': {
+        'python-rrdtool': ['rrdtool'],
+    },
+}
 
 class ImageLoader(object):
     """
@@ -94,11 +119,16 @@ class ImageLoader(object):
         image.fs = self.load_fsdump(analysis_report)
 
         # Npms
+        log.info('Loading image npms')
         image.npms = self.load_npms(analysis_report, image)
 
         # Gems
+        log.info('Loading image gems')
         image.gems = self.load_gems(analysis_report, image)
 
+        # CPEs
+        log.info('Loading image cpes')
+        image.cpes = self.load_cpes(analysis_report, image)
 
         analysis_artifact_loaders = [
             self.load_retrieved_files,
@@ -481,11 +511,11 @@ class ImageLoader(object):
             n.path_hash = hashlib.sha256(path).hexdigest()
             n.path = path
             n.name = npm_json.get('name')
-            n.src_pkg = npms_json.get('src_pkg')
-            n.origins_json = npms_json.get('origins')
-            n.licenses_json = npms_json.get('lics')
-            n.latest = npms_json.get('latest')
-            n.versions_json = npms_json.get('versions')
+            n.src_pkg = npm_json.get('src_pkg')
+            n.origins_json = npm_json.get('origins')
+            n.licenses_json = npm_json.get('lics')
+            n.latest = npm_json.get('latest')
+            n.versions_json = npm_json.get('versions')
             n.image_user_id = containing_image.user_id
             n.image_id = containing_image.id
             npms.append(n)
@@ -514,3 +544,315 @@ class ImageLoader(object):
             gems.append(n)
 
         return gems
+
+    def _fuzzy_python(self, input_el):
+        global nomatch_inclusions
+
+        known_nomatch_inclusions = nomatch_inclusions.get('python', {})
+
+        ret_names = [input_el]
+        
+        if input_el in known_nomatch_inclusions:
+            for n in known_nomatch_inclusions[input_el]:
+                if n not in ret_names:
+                    ret_names.append(n)
+
+        return(ret_names)
+
+    def _fuzzy_npm(self, input_el):
+        global nomatch_inclusions
+
+        known_nomatch_inclusions = nomatch_inclusions.get('npm', {})
+
+        ret_names = [input_el]
+        
+        if input_el in known_nomatch_inclusions:
+            for n in known_nomatch_inclusions[input_el]:
+                if n not in ret_names:
+                    ret_names.append(n)
+
+        return(ret_names)
+
+    def _fuzzy_gem(self, input_el):
+        global nomatch_inclusions
+
+        known_nomatch_inclusions = nomatch_inclusions.get('gem', {})
+
+        ret_names = [input_el]
+        
+        if input_el in known_nomatch_inclusions:
+            for n in known_nomatch_inclusions[input_el]:
+                if n not in ret_names:
+                    ret_names.append(n)
+
+        return(ret_names)
+
+    def _fuzzy_java(self, input_el):
+        global nomatch_inclusions
+
+        known_nomatch_inclusions = nomatch_inclusions.get('java', {})
+
+        ret_names = []
+        ret_versions = []
+
+        iversion = input_el.get('implementation-version', "N/A")
+        if iversion != 'N/A':
+            ret_versions.append(iversion)
+
+        sversion = input_el.get('specification-version', "N/A")
+        if sversion != 'N/A':
+            if sversion not in ret_versions:
+                ret_versions.append(sversion)
+
+        # do some heuristic tokenizing
+        try:
+            toks = re.findall("[^-]+", input_el['name'])
+            firstname = None
+            fullname = []
+            firstversion = None
+            fullversion = []
+
+            doingname = True
+            for tok in toks:
+                if re.match("^[0-9]", tok):
+                    doingname = False
+
+                if doingname:
+                    if not firstname:
+                        firstname = tok
+                    else:
+                        fullname.append(tok)
+                else:
+                    if not firstversion:
+                        firstversion = tok
+                    else:
+                        fullversion.append(tok)
+
+            if firstname:
+                firstname_nonums = re.sub("[0-9].*$", "", firstname)
+                for gthing in [firstname, firstname_nonums]:
+                    if gthing not in ret_names:
+                        ret_names.append(gthing)
+                    if '-'.join([gthing]+fullname) not in ret_names:
+                        ret_names.append('-'.join([gthing]+fullname))
+
+            if firstversion:
+                firstversion_nosuffix = re.sub("\.(RELEASE|GA|SEC.*)$", "", firstversion)
+                for gthing in [firstversion, firstversion_nosuffix]:
+                    if gthing not in ret_versions:
+                        ret_versions.append(gthing)
+                    if '-'.join([gthing]+fullversion) not in ret_versions:
+                        ret_versions.append('-'.join([gthing]+fullversion))
+
+            # attempt to get some hints from the manifest, if available
+            try:
+                manifest = input_el['metadata'].get('MANIFEST.MF', None)
+                if manifest:
+                    pnames = []
+                    manifest = re.sub("\r\n ", "", manifest)
+                    for mline in manifest.splitlines():
+                        if mline:
+                            key,val = mline.split(" ",1)
+                            if key.lower() == 'export-package:':
+                                val = re.sub(';uses:=".*?"', '', val)
+                                val = re.sub(';version=".*?"', '', val)
+                                val = val.split(';')[0]
+                                pnames = pnames + val.split(',')
+                            #elif key.lower() == 'bundle-symbolicname:':
+                            #    pnames.append(val)
+                            #elif key.lower() == 'name:':
+                            #    tmp = val.split("/")
+                            #    pnames.append('.'.join(tmp[:-1]))
+
+                    packagename = None
+                    if pnames:
+                        shortest = min(pnames)
+                        longest = max(pnames)
+                        if shortest == longest:
+                            packagename = shortest
+                        else:
+                            for i in range(0, len(shortest)):
+                                if i > 0 and shortest[i] != longest[i]:
+                                    packagename = shortest[:i-1]
+                                    break
+                    if packagename:
+                        candidate = packagename.split(".")[-1]
+                        if candidate in known_nomatch_inclusions.keys():
+                            for matchmap_candidate in known_nomatch_inclusions[candidate]:
+                                if matchmap_candidate not in ret_names:
+                                    ret_names.append(matchmap_candidate)
+                        elif (candidate not in ['com', 'org', 'net'] and len(candidate) > 2):
+                            for r in list(ret_names):
+                                if r in candidate and candidate not in ret_names:
+                                    ret_names.append(candidate)
+
+            except Exception as err:
+                log.err(err)
+
+        except Exception as err:
+            log.warn("failed to detect java package name/version guesses - exception: " + str(err))
+
+        return(ret_names, ret_versions)
+
+    def load_cpes(self, analysis_json, containing_image):
+        allcpes = {}
+        cpes = []
+        
+        # do java first (from analysis)
+        java_json_raw = analysis_json.get('package_list', {}).get('pkgs.java', {}).get('base')
+        if java_json_raw:
+            for path, java_str in java_json_raw.items():
+                java_json = json.loads(java_str)
+
+                try:
+                    guessed_names, guessed_versions = self._fuzzy_java(java_json)
+                except Exception as err:
+                    guessed_names = guessed_versions = []
+
+                for n in guessed_names:
+                    for v in guessed_versions:
+                        rawcpe = "cpe:/a:-:{}:{}".format(n, v)
+
+                        toks = rawcpe.split(":")
+                        final_cpe = ['cpe', '-', '-', '-', '-', '-', '-']
+                        for i in range(1, len(final_cpe)):
+                            try:
+                                if toks[i]:
+                                    final_cpe[i] = toks[i]
+                                else:
+                                    final_cpe[i] = '-'
+                            except:
+                                final_cpe[i] = '-'
+                        cpekey = ':'.join(final_cpe + [path])
+
+                        if cpekey not in allcpes:
+                            allcpes[cpekey] = True
+
+                            cpe = ImageCpe()
+                            cpe.pkg_type = "java"
+                            cpe.pkg_path = path
+                            cpe.cpetype = final_cpe[1]
+                            cpe.vendor = final_cpe[2]
+                            cpe.name = final_cpe[3]
+                            cpe.version = final_cpe[4]
+                            cpe.update = final_cpe[5]
+                            cpe.meta = final_cpe[6]
+                            cpe.image_user_id = containing_image.user_id
+                            cpe.image_id = containing_image.id
+
+                            cpes.append(cpe)
+
+
+        python_json_raw = analysis_json.get('package_list', {}).get('pkgs.python', {}).get('base')
+        if python_json_raw:
+            for path, python_str in python_json_raw.items():
+                python_json = json.loads(python_str)
+                guessed_names = self._fuzzy_python(python_json['name'])
+                guessed_versions = [python_json['version']]
+
+                for n in guessed_names:
+                    for v in guessed_versions:
+                        rawcpe = "cpe:/a:-:{}:{}:-:~~~python~~".format(n, v)
+
+                        toks = rawcpe.split(":")
+                        final_cpe = ['cpe', '-', '-', '-', '-', '-', '-']
+                        for i in range(1, len(final_cpe)):
+                            try:
+                                if toks[i]:
+                                    final_cpe[i] = toks[i]
+                                else:
+                                    final_cpe[i] = '-'
+                            except:
+                                final_cpe[i] = '-'
+                        cpekey = ':'.join(final_cpe + [path])
+
+                        if cpekey not in allcpes:
+                            allcpes[cpekey] = True
+
+                            cpe = ImageCpe()
+                            cpe.pkg_type = "python"
+                            cpe.pkg_path = path
+                            cpe.cpetype = final_cpe[1]
+                            cpe.vendor = final_cpe[2]
+                            cpe.name = final_cpe[3]
+                            cpe.version = final_cpe[4]
+                            cpe.update = final_cpe[5]
+                            cpe.meta = final_cpe[6]
+                            cpe.image_user_id = containing_image.user_id
+                            cpe.image_id = containing_image.id
+
+                            cpes.append(cpe)
+
+        if containing_image.gems:
+            for gem in containing_image.gems:
+                guessed_names = self._fuzzy_gem(gem.name)
+                for n in guessed_names:
+                    for version in gem.versions_json:
+                        rawcpe = "cpe:/a:-:{}:{}:-:~~~ruby~~".format(n, version)
+
+                        toks = rawcpe.split(":")
+                        final_cpe = ['cpe', '-', '-', '-', '-', '-', '-']
+                        for i in range(1, len(final_cpe)):
+                            try:
+                                if toks[i]:
+                                    final_cpe[i] = toks[i]
+                                else:
+                                    final_cpe[i] = '-'
+                            except:
+                                final_cpe[i] = '-'
+                        cpekey = ':'.join(final_cpe + [gem.path])
+
+                        if cpekey not in allcpes:
+                            allcpes[cpekey] = True
+
+                            cpe = ImageCpe()
+                            cpe.pkg_type = "gem"
+                            cpe.pkg_path = gem.path
+                            cpe.cpetype = final_cpe[1]
+                            cpe.vendor = final_cpe[2]
+                            cpe.name = final_cpe[3]
+                            cpe.version = final_cpe[4]
+                            cpe.update = final_cpe[5]
+                            cpe.meta = final_cpe[6]
+                            cpe.image_user_id = containing_image.user_id
+                            cpe.image_id = containing_image.id
+
+                            cpes.append(cpe)
+
+        if containing_image.npms:
+            for npm in containing_image.npms:
+                guessed_names = self._fuzzy_npm(npm.name)
+                for n in guessed_names:
+                    for version in npm.versions_json:
+                        rawcpe = "cpe:/a:-:{}:{}:-:~~~node.js~~".format(n, version)
+
+                        toks = rawcpe.split(":")
+                        final_cpe = ['cpe', '-', '-', '-', '-', '-', '-']
+                        for i in range(1, len(final_cpe)):
+                            try:
+                                if toks[i]:
+                                    final_cpe[i] = toks[i]
+                                else:
+                                    final_cpe[i] = '-'
+                            except:
+                                final_cpe[i] = '-'
+                        cpekey = ':'.join(final_cpe + [npm.path])
+
+                        if cpekey not in allcpes:
+                            allcpes[cpekey] = True
+
+                            cpe = ImageCpe()
+                            cpe.pkg_type = "npm"
+                            cpe.pkg_path = npm.path
+                            cpe.cpetype = final_cpe[1]
+                            cpe.vendor = final_cpe[2]
+                            cpe.name = final_cpe[3]
+                            cpe.version = final_cpe[4]
+                            cpe.update = final_cpe[5]
+                            cpe.meta = final_cpe[6]
+                            cpe.image_user_id = containing_image.user_id
+                            cpe.image_id = containing_image.id
+
+                            cpes.append(cpe)
+
+        return cpes

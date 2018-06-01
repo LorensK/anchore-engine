@@ -24,6 +24,56 @@ upgrade_enabled = True
 # Set at module level for any db module that needs db upgrade ability
 my_module_upgrade_id = 1
 
+def do_db_compatibility_check():
+    required_pg_version = (9,6)
+
+    try:
+        engine = anchore_engine.db.entities.common.get_engine()
+        if engine.dialect.server_version_info >= required_pg_version:
+            return(True)
+        else:
+            raise Exception("discovered db version {} is not >= required db version {}".format(engine.dialect.server_version_info, required_pg_version))
+    except Exception as err:
+        raise err
+
+    raise Exception("database compatibility could not be performed")
+
+def do_db_post_actions(localconfig=None):
+    do_user_update(localconfig=localconfig)
+
+def do_user_update(localconfig=None):
+    # configure users into the system from configuration, once connected to the DB and boostrapped
+    from anchore_engine.db import db_users, session_scope
+    if localconfig:
+        with session_scope() as dbsession:
+            try:
+                for userId in localconfig['credentials']['users']:
+                    if not localconfig['credentials']['users'][userId]:
+                        localconfig['credentials']['users'][userId] = {}
+
+                    cuser = localconfig['credentials']['users'][userId]
+
+                    password = cuser.pop('password', None)
+                    email = cuser.pop('email', None)
+                    if password and email:
+                        db_users.add(userId, password, {'email': email, 'active': True}, session=dbsession)
+                    else:
+                        raise Exception("user defined but has empty password/email: " + str(userId))
+
+                user_records = db_users.get_all(session=dbsession)
+                for user_record in user_records:
+                    if user_record['userId'] == 'anchore-system':
+                        continue
+                    if user_record['userId'] not in localconfig['credentials']['users']:
+                        logger.info("flagging user '"+str(user_record['userId']) + "' as inactive (in DB, not in configuration)")
+                        db_users.update(user_record['userId'], user_record['password'], {'active': False}, session=dbsession)
+
+            except Exception as err:
+                raise Exception("Initialization failed: could not add users from config into DB - exception: " + str(err))
+
+
+
+
 
 def get_versions():
     code_versions = {}
@@ -38,7 +88,6 @@ def get_versions():
         from anchore_engine.db import db_anchore, session_scope
         with session_scope() as dbsession:
             db_versions = db_anchore.get(session=dbsession)
-
     except Exception as err:
         if is_table_not_found(err):
             logger.info("anchore table not found")
@@ -100,7 +149,7 @@ def do_db_bootstrap(localconfig=None):
             except Exception as err:
                 raise Exception("Initialization failed: could not fetch/add anchore-system user from/to DB - exception: " + str(err))
 
-            if localconfig:
+            if False and localconfig:
                 try:
                     for userId in localconfig['credentials']['users']:
                         if not localconfig['credentials']['users'][userId]:
@@ -393,7 +442,6 @@ def archive_data_upgrade_005_006():
     """
 
     from anchore_engine.db import ArchiveDocument, session_scope, ArchiveMetadata
-    import anchore_engine.subsys.object_store
     from anchore_engine.subsys import archive
     from anchore_engine.subsys.archive import operations
     from anchore_engine.configuration import localconfig
@@ -401,6 +449,9 @@ def archive_data_upgrade_005_006():
     config = localconfig.get_config()
     archive.initialize(config.get('services', {}).get('catalog', {}))
     client = operations.get_archive().primary_client
+
+    session_counter = 0
+    max_pending_session_size = 10000
 
     with session_scope() as db_session:
         for doc in db_session.query(ArchiveDocument.userId, ArchiveDocument.bucket, ArchiveDocument.archiveId, ArchiveDocument.documentName, ArchiveDocument.created_at, ArchiveDocument.last_updated, ArchiveDocument.record_state_key, ArchiveDocument.record_state_val):
@@ -418,7 +469,12 @@ def archive_data_upgrade_005_006():
                                    )
 
             db_session.add(meta)
-            db_session.flush()
+
+            session_counter += 1
+
+            if session_counter >= max_pending_session_size:
+                db_session.flush()
+                session_counter = 0
 
 
 def fixed_artifact_upgrade_005_006():
@@ -457,6 +513,46 @@ def db_upgrade_005_006():
     archive_data_upgrade_005_006()
     fixed_artifact_upgrade_005_006()
 
+def catalog_image_upgrades_006_007():
+    engine = anchore_engine.db.entities.common.get_engine()
+
+    new_columns = [
+        {
+            'table_name': 'catalog_image',
+            'columns': [
+                Column('analyzed_at', Integer, primary_key=False)
+            ]
+        },
+        {
+            'table_name': 'catalog_image_docker',
+            'columns': [
+                Column('tag_detected_at', Integer, primary_key=False)
+            ]
+        }
+    ]
+
+    for table in new_columns:
+        for column in table['columns']:
+            try:
+                cn = column.compile(dialect=engine.dialect)
+                ct = column.type.compile(engine.dialect)
+                engine.execute('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s' % (table['table_name'], cn, ct))
+            except Exception as e:
+                log.err('failed to perform DB upgrade on {} adding column - exception: {}'.format(table, str(e)))
+                raise Exception('failed to perform DB upgrade on {} adding column - exception: {}'.format(table, str(e)))
+
+    try:
+        engine.execute("UPDATE catalog_image SET analyzed_at=last_updated WHERE analyzed_at IS NULL AND analysis_status='analyzed'")
+    except Exception as e:
+        raise Exception('failed to perform DB upgrade on catalog_image setting default value for column analyzed_at - exception: {}'.format(str(e)))
+
+    try:
+        engine.execute("UPDATE catalog_image_docker SET tag_detected_at=created_at WHERE tag_detected_at IS NULL")
+    except Exception as e:
+        raise Exception('failed to perform DB upgrade on catalog_image_docker setting default value for column tag_detected_at - exception: {}'.format(str(e)))
+
+def db_upgrade_006_007():
+    catalog_image_upgrades_006_007()
 
 # Global upgrade definitions. For a given version these will be executed in order of definition here
 # If multiple functions are defined for a version pair, they will be executed in order.
@@ -466,7 +562,8 @@ upgrade_functions = (
     (('0.0.2', '0.0.3'), [ db_upgrade_002_003 ]),
     (('0.0.3', '0.0.4'), [ db_upgrade_003_004 ]),
     (('0.0.4', '0.0.5'), [ db_upgrade_004_005 ]),
-    (('0.0.5', '0.0.6'), [ db_upgrade_005_006 ])
+    (('0.0.5', '0.0.6'), [ db_upgrade_005_006 ]),
+    (('0.0.6', '0.0.7'), [ db_upgrade_006_007 ])
 )
 
 

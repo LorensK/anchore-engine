@@ -9,6 +9,7 @@ import traceback
 from contextlib import contextmanager
 
 import sqlalchemy
+from sqlalchemy import types
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 import datetime
@@ -81,6 +82,15 @@ def anchore_now():
     """
     return (int(time.time()))
 
+
+def anchore_now_datetime():
+    return datetime.datetime.utcnow()
+
+
+def anchore_uuid():
+    return uuid.uuid4().get_hex()
+
+
 def get_entity_tables(entity):
     global Base
 
@@ -102,6 +112,7 @@ def test_connection():
     test_connection = None
     try:
         test_connection = engine.connect()
+
     except Exception as err:
         raise Exception("test connection failed - exception: " + str(err))
     finally:
@@ -116,14 +127,16 @@ def do_connect(db_params):
     db_connect_args = db_params.get('db_connect_args', None)
     db_pool_size = db_params.get('db_pool_size', None)
     db_pool_max_overflow = db_params.get('db_pool_max_overflow', None)
+    db_echo = db_params.get('db_echo', False)
 
     if db_connect:
         try:
             if db_connect.startswith('sqlite://'):
                 # Special case for testing with sqlite. Not for production use, unit tests only
-                engine = sqlalchemy.create_engine(db_connect, echo=False)
+                engine = sqlalchemy.create_engine(db_connect, echo=db_echo)
             else:
-                engine = sqlalchemy.create_engine(db_connect, connect_args=db_connect_args, echo=False,
+                logger.debug("database connection args {} db_echo={}".format(db_connect_args, db_echo))
+                engine = sqlalchemy.create_engine(db_connect, connect_args=db_connect_args, echo=db_echo,
                                                   pool_size=db_pool_size, max_overflow=db_pool_max_overflow)
 
         except Exception as err:
@@ -156,8 +169,10 @@ def get_params(localconfig):
         # connect to DB using db_connect from configuration
         db_connect = None
         db_connect_args = {}
-        db_pool_size = 10
-        db_pool_max_overflow = 20
+        db_pool_size = 30
+        db_pool_max_overflow = 75
+        db_echo = False
+
         if 'db_connect' in db_auth and db_auth['db_connect']:
             db_connect = db_auth['db_connect']
         if 'db_connect_args' in db_auth and db_auth['db_connect_args']:
@@ -166,6 +181,8 @@ def get_params(localconfig):
             db_pool_size = int(db_auth['db_pool_size'])
         if 'db_pool_max_overflow' in db_auth:
             db_pool_max_overflow = int(db_auth['db_pool_max_overflow'])
+        if 'db_echo' in db_auth:
+            db_echo = db_auth['db_echo'] in [True, 'True', 'true']
     except:
         raise Exception(
             "could not locate credentials->database entry from configuration: add 'database' section to 'credentials' section in configuration file")
@@ -174,7 +191,8 @@ def get_params(localconfig):
         'db_connect': db_connect,
         'db_connect_args': db_connect_args,
         'db_pool_size': db_pool_size,
-        'db_pool_max_overflow': db_pool_max_overflow
+        'db_pool_max_overflow': db_pool_max_overflow,
+        'db_echo': db_echo
     }
     return(ret)
 
@@ -191,7 +209,7 @@ def do_create(specific_tables):
         raise Exception("could not create/re-create DB tables - exception: " + str(err))
 
 
-def initialize(localconfig=None, versions=None, bootstrap_db=False, specific_tables=None, bootstrap_users=False):
+def initialize(localconfig=None, versions=None):
     """
     Initialize the db for use. Optionally bootstrap it and optionally only for specific entities.
 
@@ -219,9 +237,6 @@ def initialize(localconfig=None, versions=None, bootstrap_db=False, specific_tab
 
             # test the connection
             rc = test_connection()
-
-            # create
-            #rc = do_create(specific_tables)
 
             break
         except Exception as err:
@@ -292,3 +307,21 @@ def init_thread_session():
         ThreadLocalSession = scoped_session(sessionmaker(bind=engine))
 
 
+class StringJSON(types.TypeDecorator):
+    """
+    A generic json text type for serialization and deserialization of json to text columns.
+    Note: will not detect modification of the content of the dict as an update. To update must change and re-assign the
+    value to the column rather than in-place updates.
+
+    """
+    impl = types.TEXT
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            value = json.dumps(value)
+            return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            value = json.loads(value)
+        return value

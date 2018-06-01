@@ -3,15 +3,15 @@ FROM centos:7
 ENV LANG=en_US.UTF-8
 EXPOSE 8228 8338
 
-RUN yum clean all -y && yum -y update && yum -y install epel-release && yum -y install skopeo-0.1.26-2.dev.git2e8377a.el7 python-pip dpkg psmisc && yum clean all -y
+RUN yum clean all -y && yum -y update && yum -y install epel-release && yum -y install skopeo python-pip dpkg psmisc && yum clean all -y
 RUN pip install --upgrade pip && pip install --upgrade setuptools 
 
 COPY ./anchore-engine /root/anchore-engine
 COPY ./anchore-cli /root/anchore-cli
-COPY ./anchore /root/anchore
+#COPY ./anchore /root/anchore
 
 RUN cd /root/anchore-engine/ && /root/anchore-engine/scripts/do-build.sh && rm -rf .git && yum clean all -y
 RUN cd /root/anchore-cli/ && /root/anchore-engine/scripts/do-build.sh && rm -rf .git && yum clean all -y
-RUN cd /root/anchore/ && /root/anchore-engine/scripts/do-build.sh && rm -rf .git && yum clean all -y
+#RUN cd /root/anchore/ && /root/anchore-engine/scripts/do-build.sh && rm -rf .git && yum clean all -y
 
 CMD /usr/bin/anchore-engine

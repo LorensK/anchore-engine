@@ -9,7 +9,8 @@ from pkg_resources import resource_filename
 import anchore_engine.services.common
 import anchore_engine.auth.common
 import anchore_engine.auth.skopeo_wrapper
-from anchore.anchore_utils import read_kvfile_todict
+#from anchore.anchore_utils import read_kvfile_todict
+from anchore_engine.analyzers.utils import read_kvfile_todict
 
 from anchore_engine import utils
 
@@ -25,7 +26,7 @@ except:
 
 def get_layertarfile(unpackdir, cachedir, layer):
 
-    layer_candidates = [os.path.join(unpackdir, 'raw', layer+".tar"), os.path.join(unpackdir, 'raw', 'blobs', 'sha256', layer)]
+    layer_candidates = [os.path.join(unpackdir, 'raw', layer+".tar"), os.path.join(unpackdir, 'raw', layer), os.path.join(unpackdir, 'raw', 'blobs', 'sha256', layer)]
     if cachedir:
         layer_candidates.append(os.path.join(cachedir, 'sha256', layer))
         
@@ -70,12 +71,12 @@ def get_tar_filenames(layertar):
     ret = []
     layertarfile = None
     try:
-        logger.debug("using tarfile library to get file names")
+        logger.debug("using tarfile library to get file names from tarfile={}".format(layertarfile))
         layertarfile = tarfile.open(layertar, mode='r', format=tarfile.PAX_FORMAT)
         ret = layertarfile.getnames()
     except:
         # python tarfile fils to unpack some docker image layers due to PAX header issue, try another method
-        logger.debug("using tar command to get file names")
+        logger.debug("using tar command to get file names from tarfile={}".format(layertarfile))
         tarcmd = "tar tf {}".format(layertar)
         try:
             ret = []
@@ -226,139 +227,6 @@ def squash(unpackdir, cachedir, layers):
 
     return ("done", imageSize)
 
-def squash_orig(unpackdir, cachedir, layers):
-    rootfsdir = unpackdir + "/rootfs"
-
-    if os.path.exists(unpackdir + "/squashed.tar"):
-        return (True)
-
-    if not os.path.exists(rootfsdir):
-        os.makedirs(rootfsdir)
-
-    revlayer = list(layers)
-    revlayer.reverse()
-
-    l_excludes = {}
-    l_opqexcludes = {} # stores list of special files to exclude only for next layer (.wh..wh..opq handling)
-
-    last_opqexcludes = {} # opq exlcudes for the last layer
-
-    for l in revlayer:
-        htype, layer = l.split(":",1)
-
-        layertar = get_layertarfile(unpackdir, cachedir, layer)
-
-        count = 0
-
-        logger.debug("\tPass 1: " + str(layertar))
-        layertarfile = tarfile.open(layertar, mode='r', format=tarfile.PAX_FORMAT)
-
-        whpatt = re.compile(".*/\.wh\..*")
-        whopqpatt = re.compile(".*/\.wh\.\.wh\.\.opq")
-
-        l_opqexcludes[layer] = {}
-
-        myexcludes = {}
-        opqexcludes = {}
-
-        for member in layertarfile.getmembers():
-            # checks for whiteout conditions
-            if whopqpatt.match(member.name):
-                # found an opq entry, which means that this files in the next layer down (only) should not be included
-
-                fsub = re.sub(r"\.wh\.\.wh\.\.opq", "", member.name, 1)
-
-                # never include the whiteout file itself
-                myexcludes[member.name] = True
-                opqexcludes[fsub] = True
-
-            elif whpatt.match(member.name):
-                # found a normal whiteout, which means that this file in any lower layer should be excluded
-                fsub = re.sub(r"\.wh\.", "", member.name, 1)
-
-                # never include a whiteout file
-                myexcludes[member.name] = True
-
-                myexcludes[fsub] = True
-
-            else:
-                # if the last processed layer had an opq whiteout, check file to see if it lives in the opq directory
-                if last_opqexcludes:
-                    dtoks = member.name.split("/")
-                    for i in range(0, len(dtoks)):
-                        dtok = '/'.join(dtoks[0:i])
-                        dtokwtrail = '/'.join(dtoks[0:i]) + "/"
-                        if dtok in last_opqexcludes or dtokwtrail in last_opqexcludes:
-                            l_opqexcludes[layer][member.name] = True
-                            break
-
-        # build up the list of excludes as we move down the layers
-        for l in l_excludes.keys():
-            myexcludes.update(l_excludes[l])
-
-        l_excludes[layer] = myexcludes
-
-        #last_opqexcludes = opqexcludes
-        last_opqexcludes.update(opqexcludes)
-        layertarfile.close()
-        
-    logger.debug("Pass 3: untarring layers with exclusions")
-
-    imageSize = 0
-    for l in layers:
-        htype, layer = l.split(":",1)
-
-        layertar = get_layertarfile(unpackdir, cachedir, layer)
-
-        imageSize = imageSize + os.path.getsize(layertar) 
-        
-        # write out the exluded files, adding the per-layer excludes if present
-        with open(unpackdir+"/efile", 'w') as OFH:
-            for efile in l_excludes[layer]:
-                OFH.write("%s\n" % efile)
-            if layer in l_opqexcludes and l_opqexcludes[layer]:
-                for efile in l_opqexcludes[layer]:
-                    logger.debug("adding special for layer exclude: " + str(efile))
-                    OFH.write("%s\n" % efile)
-
-        retry = True
-        success = False
-        last_err = None
-        max_retries = 10
-        retries = 0
-        while (not success) and (retry):
-            tarcmd = "tar -C " + rootfsdir + " -x -X " + unpackdir+"/efile -f " + layertar
-            logger.debug("untarring squashed tarball: " + str(tarcmd))
-            try:
-                rc, sout, serr = utils.run_command(tarcmd)
-                if rc != 0:
-                    logger.debug("tar error encountered, attempting to handle")
-                    handled = handle_tar_error(tarcmd, rc, sout, serr, unpackdir=unpackdir, rootfsdir=rootfsdir, layer=layer, layertar=layertar)
-                    if not handled:
-                        raise Exception("command failed: cmd="+str(tarcmd)+" exitcode="+str(rc)+" stdout="+str(sout).strip()+" stderr="+str(serr).strip())
-                    else:
-                        logger.debug("tar error successfully handled, retrying")
-                else:
-                    logger.debug("command succeeded: stdout="+str(sout).strip()+" stderr="+str(serr).strip())
-                    success = True
-            except Exception as err:
-                logger.error("command failed with exception - " + str(err))
-                last_err = err
-                success = False
-                retry = False
-                
-            # safety net
-            if retries > max_retries:
-                retry = False
-            retries = retries + 1
-
-        if not success:
-            if last_err:
-                raise last_err
-            else:
-                raise Exception("unknown exception in untar")
-
-    return ("done", imageSize)
 
 def make_staging_dirs(rootdir, use_cache_dir=None):
     if not os.path.exists(rootdir):
@@ -507,88 +375,6 @@ def get_image_metadata_v1(staging_dirs, imageDigest, imageId, manifest_data, doc
 
     return(docker_history, layers, dockerfile_contents, dockerfile_mode, imageArch)
 
-def get_image_metadata_v2_orig(staging_dirs, imageDigest, imageId, manifest_data, dockerfile_contents="", dockerfile_mode=""):
-    outputdir = staging_dirs['outputdir']
-    unpackdir = staging_dirs['unpackdir']
-    copydir = staging_dirs['copydir']
-
-    rawlayers = manifest_data['layers']
-
-    hfinal = []
-    layers = []
-    docker_history = []
-    imageArch = ""
-
-    # get "history"    
-    try:
-        with open(os.path.join(copydir, imageId+".tar"), 'r') as FH:
-            configdata = json.loads(FH.read())
-            rawhistory = configdata['history']
-            imageArch = configdata['architecture']
-    except Exception as err:
-        raise err
-
-    try:
-        done=False
-        idx = 0
-        while not done:
-            if not rawhistory:
-                done = True
-            else:
-                hel = rawhistory.pop(0)
-                if 'empty_layer' in hel and hel['empty_layer']:
-                    lid = "<missing>"
-                    lsize = 0
-                else:
-                    lel = rawlayers.pop(0)
-                    lid = lel['digest']
-                    layers.append(lid)
-                    lsize = lel['size']
-
-                try:
-                    lcreatedby = hel['created_by']
-                except:
-                    lcreatedby = ""
-
-                lcreated = hel['created']
-
-                hfinal.append(
-                    {
-                        'Created': lcreated,
-                        'CreatedBy': lcreatedby,
-                        'Comment': '',
-                        'Id': lid,
-                        'Size': lsize,
-                        'Tags': []
-                    }
-                )
-
-        docker_history = hfinal
-        if hfinal:
-            with open(os.path.join(unpackdir, "docker_history.json"), 'w') as OFH:
-                OFH.write(json.dumps(hfinal))
-    except Exception as err:
-        raise err
-
-    if not dockerfile_contents:
-        # get dockerfile_contents (translate history to guessed DF)
-        # TODO 'FROM' guess?
-        dockerfile_contents = "FROM scratch\n"
-        for hel in docker_history:
-            patt = re.match("^/bin/sh -c #\(nop\) +(.*)", hel['CreatedBy'])
-            if patt:
-                cmd = patt.group(1)
-            elif hel['CreatedBy']:
-                cmd = "RUN " + hel['CreatedBy']
-            else:
-                cmd = None
-            if cmd:
-                dockerfile_contents = dockerfile_contents + cmd + "\n"        
-        dockerfile_mode = "Guessed"
-    elif not dockerfile_mode:
-        dockerfile_mode = "Actual"
-
-    return(docker_history, layers, dockerfile_contents, dockerfile_mode, imageArch)
 
 def get_image_metadata_v2(staging_dirs, imageDigest, imageId, manifest_data, dockerfile_contents="", dockerfile_mode=""):
     outputdir = staging_dirs['outputdir']
@@ -596,20 +382,24 @@ def get_image_metadata_v2(staging_dirs, imageDigest, imageId, manifest_data, doc
     copydir = staging_dirs['copydir']
     cachedir = staging_dirs['cachedir']
 
-    rawlayers = manifest_data['layers']
+    rawlayers = list(manifest_data['layers'])
 
     hfinal = []
     layers = []
     docker_history = []
     imageArch = ""
 
-    # get "history"    
+    # get "history"
     if os.path.exists(os.path.join(copydir, imageId+".tar")):
         try:
             with open(os.path.join(copydir, imageId+".tar"), 'r') as FH:
                 configdata = json.loads(FH.read())
                 rawhistory = configdata['history']
                 imageArch = configdata['architecture']
+                imageOs = configdata.get('os', None)
+                if imageOs in ['windows']:
+                    raise Exception("reported os type ({}) images are not supported".format(imageOs))
+                    
         except Exception as err:
             raise err
     elif os.path.exists(os.path.join(copydir, "index.json")):
@@ -637,6 +427,9 @@ def get_image_metadata_v2(staging_dirs, imageDigest, imageId, manifest_data, doc
                     configdata = json.loads(FH.read())
                     rawhistory = configdata['history']
                     imageArch = configdata['architecture']
+                    imageOs = configdata.get('os', None)
+                    if imageOs in ['windows']:
+                        raise Exception("image os type ({}) not supported".format(imageOs))
             else:
                 raise Exception("could not find final digest - no blob config file found in digest file: {}".format(dfile))
 
@@ -718,18 +511,20 @@ def unpack(staging_dirs, layers):
     return(imageSize)
 
 
-def run_anchore_analyzers(staging_dirs, imageDigest, imageId):
+def run_anchore_analyzers(staging_dirs, imageDigest, imageId, localconfig):
     outputdir = staging_dirs['outputdir']
     unpackdir = staging_dirs['unpackdir']
     copydir = staging_dirs['copydir']
+    configdir = localconfig['service_dir']
 
     # run analyzers
-    anchore_module_root = resource_filename("anchore", "anchore-modules")
-    analyzer_root = os.path.join(anchore_module_root, "analyzers")
+    #anchore_module_root = resource_filename("anchore", "anchore-modules")
+    anchore_module_root = resource_filename("anchore_engine", "analyzers")
+    analyzer_root = os.path.join(anchore_module_root, "modules")
     for f in os.listdir(analyzer_root):
         thecmd = os.path.join(analyzer_root, f)
         if re.match(".*\.py$", thecmd):
-            cmdstr = " ".join([thecmd, imageId, unpackdir, outputdir, unpackdir])
+            cmdstr = " ".join([thecmd, configdir, imageId, unpackdir, outputdir, unpackdir])
             if True:
                 try:
                     rc, sout, serr = utils.run_command(cmdstr)
@@ -741,8 +536,6 @@ def run_anchore_analyzers(staging_dirs, imageDigest, imageId):
                     logger.error("command failed with exception - " + str(err))
                     #raise err
 
-    analyzer_manifest = {}
-    #TODO populate analyzer_manifest?
     analyzer_report = {}
     for analyzer_output in os.listdir(os.path.join(outputdir, "analyzer_output")):
         if analyzer_output not in analyzer_report:
@@ -803,7 +596,7 @@ def generate_image_export(staging_dirs, imageDigest, imageId, analyzer_report, i
     )
     return(image_report)
     
-def analyze_image(userId, manifest, image_record, tmprootdir, registry_creds=[], use_cache_dir=None):
+def analyze_image(userId, manifest, image_record, tmprootdir, localconfig, registry_creds=[], use_cache_dir=None):
     # need all this
 
     imageId = None
@@ -831,6 +624,9 @@ def analyze_image(userId, manifest, image_record, tmprootdir, registry_creds=[],
                 dest_type = 'dir'
             else:
                 dest_type = 'oci'
+
+            #analyzer_manifest = {}
+            #analyzer_manifest.update(manifest_data)
 
         except Exception as err:
             raise Exception("cannot load manifest as JSON rawmanifest="+str(manifest)+") - exception: " + str(err))
@@ -873,7 +669,7 @@ def analyze_image(userId, manifest, image_record, tmprootdir, registry_creds=[],
         imageSize = unpack(staging_dirs, layers)
 
         familytree = layers
-        analyzer_report = run_anchore_analyzers(staging_dirs, imageDigest, imageId)
+        analyzer_report = run_anchore_analyzers(staging_dirs, imageDigest, imageId, localconfig)
 
         image_report = generate_image_export(staging_dirs, imageDigest, imageId, analyzer_report, imageSize, fulltag, docker_history, dockerfile_mode, dockerfile_contents, layers, familytree, imageArch, pullstring, analyzer_manifest)
 

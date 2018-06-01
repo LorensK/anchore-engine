@@ -2,6 +2,9 @@ import json
 import uuid
 import hashlib
 import time
+import base64
+
+from dateutil import parser as dateparser
 
 import anchore_engine.services.common
 import anchore_engine.configuration.localconfig
@@ -13,7 +16,7 @@ from anchore_engine import utils as anchore_utils
 from anchore_engine.subsys import taskstate, logger, archive as archive_sys, notifications
 import anchore_engine.subsys.metrics
 from anchore_engine.clients import localanchore, simplequeue
-from anchore_engine.db import db_users, db_subscriptions, db_catalog_image, db_policybundle, db_policyeval, db_eventlog, \
+from anchore_engine.db import db_users, db_subscriptions, db_catalog_image, db_policybundle, db_policyeval, db_events, \
     db_registries, db_services, db_archivedocument
 import anchore_engine.clients.policy_engine
 
@@ -585,7 +588,7 @@ def subscriptions(dbsession, request_inputs, subscriptionId=None, bodycontent={}
 
     return(return_object, httpcode)
 
-def events(dbsession, request_inputs, bodycontent={}):
+def events(dbsession, request_inputs, bodycontent=None):
     user_auth = request_inputs['auth']
     method = request_inputs['method']
     params = request_inputs['params']
@@ -603,167 +606,89 @@ def events(dbsession, request_inputs, bodycontent={}):
                 raise err
         
         if method == 'GET':
-            records = db_eventlog.get_byfilter(session=dbsession, **jsondata)
-            if not records:
+            dbfilter = dict()
+
+            if params.get('source_servicename', None):
+                dbfilter['source_servicename'] = params.get('source_servicename')
+
+            if params.get('source_hostid', None):
+                dbfilter['source_hostid'] = params.get('source_hostid')
+
+            if params.get('resource_type', None):
+                dbfilter['resource_type'] = params.get('resource_type')
+
+            if params.get('level', None):
+                dbfilter['level'] = params.get('level')
+
+            since = None
+            if params.get('since', None):
+                try:
+                    since = dateparser.parse(params.get('since'))
+                except:
+                    httpcode = 400
+                    raise Exception('Invalid value for since query parameter, must be valid datetime string')
+
+            before = None
+            if params.get('before', None):
+                try:
+                    before = dateparser.parse(params.get('before'))
+                except:
+                    httpcode = 400
+                    raise Exception('Invalid value before query parameter, must be valid datetime string')
+
+            next = None
+            if params.get('next', None):
+                try:
+                    next = dateparser.parse(params.get('next'))
+                except:
+                    httpcode = 400
+                    raise Exception('Invalid value for next query parameter')
+
+            ret = db_events.get_byfilter(userId=userId, session=dbsession, since=since, before=before, next=next, **dbfilter)
+            if not ret:
                 httpcode = 404
                 raise Exception("events not found in DB")
             else:
-                return_object = records
+                return_object = ret
                 httpcode = 200
 
         elif method == 'DELETE':
-            rc = db_eventlog.delete_byfilter(session=dbsession, **jsondata)
-            if not rc:
-                raise Exception("DB delete failed")
-            else:
-                httpcode = 200
-                return_object = True
+            since = None
+            if params.get('since', None):
+                try:
+                    since = dateparser.parse(params.get('since'))
+                except:
+                    httpcode = 400
+                    raise Exception('Invalid value for since query parameter, must be valid datetime string')
 
-        elif method == 'POST' or method == 'PUT':
-            hostId = jsondata['hostId']
-            service_name = jsondata['service_name']
-            message = jsondata['message']
-            level = jsondata['level']
-            
-            record = db_eventlog.get(hostId, service_name, message, level, session=dbsession)
+            before = None
+            if params.get('before', None):
+                try:
+                    before = dateparser.parse(params.get('before'))
+                except:
+                    httpcode = 400
+                    raise Exception('Invalid value before query parameter, must be valid datetime string')
 
-            if method == 'PUT' and not record:
-                httpcode = 404
-                raise Exception("existing event not found to update")
-            else:
-                record.update(jsondata)
-                rc = db_eventlog.update(hostId, service_name, message, level, jsondata, session=dbsession)
-                if not rc:
-                    raise Exception("DB update failed")
-                else:
-                    httpcode = 200
-                    return_object = record
-
-    except Exception as err:
-        return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
-
-    return(return_object, httpcode)
-
-def policies(dbsession, request_inputs, bodycontent={}):
-    user_auth = request_inputs['auth']
-    method = request_inputs['method']
-    params = request_inputs['params']
-    userId = request_inputs['userId']
-
-    return_object = {}
-    httpcode = 500
-
-    try:
-        jsondata = {}
-        if bodycontent:
-            try:
-                jsondata = bodycontent
-            except Exception as err:
-                raise err
-        
-        if 'policyId' in jsondata:
-            policyId = jsondata['policyId']
-        else:
-            policyId = None
-
-        if 'active' in jsondata:
-            active = jsondata['active']
-        else:
-            active = True
-
-        logger.debug("looking up policy record: " + userId + " : " + str(policyId))
-
-        if method == 'GET':
-
-            # set up the filter based on input
-            dbfilter = {}
-            if policyId:
-                dbfilter['policyId'] = policyId
-
-            records = db_policybundle.get_byfilter(userId, session=dbsession, **dbfilter)
-            if not records:
-                httpcode = 404
-                raise Exception("policy not found in DB")
-            else:
-                for record in records:
-                    record['policybundle'] = {}
-                    try:
-                        policybundle = archive_sys.get_document(userId, 'policy_bundles', record['policyId'])
-                        if policybundle:
-                            record['policybundle'] = policybundle
-
-                            record['policybundlemeta'] = {}
-                            meta = archive_sys.get_document_meta(userId, 'policy_bundles', record['policyId'])
-                            if meta:
-                                record['policybundlemeta'] = meta
-
-                    except Exception as err:
-                        logger.warn("failed to fetch policy bundle from archive - exception: " + str(err))
-                        raise anchore_engine.services.common.make_anchore_exception(err, input_message="failed to fetch policy bundle from archive", input_httpcode=500)
-
-                return_object = records
-                logger.info('Policy obj: {}'.format(return_object))
-                httpcode = 200
-
-        elif method == 'DELETE':
-            if not policyId:
-                raise Exception ("must include 'policyId' in the json payload for this operation")
+            ret = db_events.delete_byfilter(userId=userId, session=dbsession, since=since, before=before)
 
             httpcode = 200
-            return_object = True
+            return_object = ret
 
-            policy_record = db_policybundle.get(userId, policyId, session=dbsession)
-            if policy_record:
-                if 'cleanup_evals' in params and params['cleanup_evals']:
-                    cleanup_evals = True
-                else:
-                    cleanup_evals = False
+        elif method == 'POST':
+            record = db_events.add(session=dbsession, msg=jsondata)
 
-                rc, httpcode = do_policy_delete(userId, policy_record, dbsession, force=True, cleanup_evals=cleanup_evals)
-                if httpcode not in range(200,299):
-                    raise Exception(str(rc))
-
-        elif method == 'POST' or method == 'PUT':
-            if not policyId:
-                raise Exception ("must include 'policyId' in the json payload for this operation")
-
-            record = db_policybundle.get(userId, policyId, session=dbsession)
-            if method == 'PUT' and not record:
-                httpcode = 404
-                raise Exception("existing policyId not found to update")
+            if record:
+                httpcode = 200
+                return_object = record
             else:
-                policybundle = jsondata['policybundle']
-
-                try:
-                    if archive_sys.put_document(userId, 'policy_bundles', policyId, policybundle):
-                        rc = db_policybundle.update(policyId, userId, active, jsondata, session=dbsession)
-                    else:
-                        rc = False
-                except Exception as err:
-                    raise anchore_engine.services.common.make_anchore_exception(err, input_message="cannot add policy, failed to update archive/DB", input_httpcode=500)
-
-                if not rc:
-                    raise Exception("DB update failed")
-                else:
-                    if active:
-                        try:
-                            rc = db_policybundle.set_active_policy(policyId, userId, session=dbsession)
-                        except Exception as err:
-                            httpcode = 500
-                            raise Exception("could not set policy as active - exception: " + str(err))
-
-                    record = db_policybundle.get(userId, policyId, session=dbsession)
-                    record['policybundle'] = jsondata['policybundle']
-
-                    httpcode = 200
-                    return_object = record
-
+                httpcode = 500
+                raise Exception('Cannot create event')
     except Exception as err:
         return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
 
     return(return_object, httpcode)
 
-def evals(dbsession, request_inputs, bodycontent={}):
+def events_eventId(dbsession, request_inputs, eventId):
     user_auth = request_inputs['auth']
     method = request_inputs['method']
     params = request_inputs['params']
@@ -773,80 +698,29 @@ def evals(dbsession, request_inputs, bodycontent={}):
     httpcode = 500
 
     try:
-        jsondata = {}
-        if bodycontent:
-            try:
-                jsondata = bodycontent
-            except Exception as err:
-                raise err
-        
-        logger.debug("looking up eval record: " + userId)
-
         if method == 'GET':
-
-            # set up the filter based on input
-            dbfilter = {}
-            for k in ['evalId', 'policyId', 'imageDigest', 'tag']:
-                if k in jsondata:
-                    dbfilter[k] = jsondata[k]
-
-            # perform an interactive eval to get/install the latest
-            try:
-                logger.debug("performing eval refresh: " + str(dbfilter))
-                imageDigest = dbfilter['imageDigest']
-                if 'tag' in dbfilter:
-                    evaltag = dbfilter['tag']
-                else:
-                    evaltag = None
-
-                if 'policyId' in dbfilter:
-                    policyId = dbfilter['policyId']
-                else:
-                    policyId = None
-
-                rc = perform_policy_evaluation(userId, imageDigest, dbsession, evaltag=evaltag, policyId=policyId)
-
-            except Exception as err:
-                logger.error("interactive eval failed, will return any in place evaluation records - exception: " + str(err))
-                
-            records = db_policyeval.tsget_byfilter(userId, session=dbsession, **dbfilter)
-            if not records:
+            ret = db_events.get_byevent_id(userId=userId, eventId=eventId, session=dbsession)
+            if not ret:
                 httpcode = 404
-                raise Exception("eval not found in DB")
+                raise Exception("Event not found")
             else:
-                return_object = records
+                return_object = ret
                 httpcode = 200
-
         elif method == 'DELETE':
-            dbfilter = {}
-            for k in ['evalId', 'policyId', 'imageDigest', 'tag']:
-                if k in jsondata:
-                    dbfilter[k] = jsondata[k]
-
-            if not dbfilter:
-                raise Exception("not enough detail in body to find records to delete")
-
-            rc = db_policyeval.delete_byfilter(userId, session=dbsession, **dbfilter)
-            if not rc:
-                raise Exception("DB delete failed")
+            ret = db_events.delete_byevent_id(userId=userId, eventId=eventId, session=dbsession)
+            if not ret:
+                httpcode = 404
+                raise Exception("Event not found")
             else:
+                return_object = None
                 httpcode = 200
-                return_object = True
-
-        elif method == 'POST' or method == 'PUT':
-            record = jsondata
-            rc = db_policyeval.tsadd(record['policyId'], userId, record['imageDigest'], record['tag'], record['final_action'], {'policyeval':record['policyeval'], 'evalId':record['evalId']}, session=dbsession)
-            if not rc:
-                raise Exception("DB update failed")
-            else:
-                httpcode = 200
-                return_object = record
 
     except Exception as err:
         return_object = anchore_engine.services.common.make_response_error(err, in_httpcode=httpcode)
 
     return(return_object, httpcode)
-                
+
+
 def users(dbsession, request_inputs):
     user_auth = request_inputs['auth']
     method = request_inputs['method']
@@ -1049,11 +923,14 @@ def system_registries(dbsession, request_inputs, bodycontent={}):
             httpcode = 200
         elif method == 'POST':
             registrydata = bodycontent
+            validate = params.get('validate', True)
+
             if 'registry' in registrydata:
                 registry=registrydata['registry']
             else:
                 httpcode = 500
                 raise Exception("body does not contain registry key")
+
             registry_records = db_registries.get(registry, userId, session=dbsession)
             if registry_records:
                 httpcode = 500
@@ -1063,6 +940,13 @@ def system_registries(dbsession, request_inputs, bodycontent={}):
             if (registrydata['registry_user'] == 'awsauto' or registrydata['registry_pass'] == 'awsauto') and not localconfig['allow_awsecr_iam_auto']:
                 httpcode = 406
                 raise Exception("'awsauto' is not enabled in service configuration")
+
+            if validate:
+                try:
+                    registry_status = anchore_engine.auth.docker_registry.ping_docker_registry(registrydata)
+                except Exception as err:
+                    httpcode = 406
+                    raise Exception("cannot ping supplied registry with supplied credentials - exception: {}".format(str(err)))
 
             rc = db_registries.add(registry, userId, registrydata, session=dbsession)
             registry_records = db_registries.get(registry, userId, session=dbsession)
@@ -1135,6 +1019,8 @@ def system_registries_registry(dbsession, request_inputs, registry, bodycontent=
             httpcode = 200
         elif method == 'PUT':
             registrydata = bodycontent
+            validate = params.get('validate', True)
+
             registry_record = db_registries.get(registry, userId, session=dbsession)
             if not registry_record:
                 httpcode = 404
@@ -1144,6 +1030,13 @@ def system_registries_registry(dbsession, request_inputs, registry, bodycontent=
             if (registrydata['registry_user'] == 'awsauto' or registrydata['registry_pass'] == 'awsauto') and not localconfig['allow_awsecr_iam_auto']:
                 httpcode = 406
                 raise Exception("'awsauto' is not enabled in service configuration")
+
+            if validate:
+                try:
+                    registry_status = anchore_engine.auth.docker_registry.ping_docker_registry(registrydata)
+                except Exception as err:
+                    httpcode = 406
+                    raise Exception("cannot ping supplied registry with supplied credentials - exception: {}".format(str(err)))
 
             rc = db_registries.update(registry, userId, registrydata, session=dbsession)
             registry_records = db_registries.get(registry, userId, session=dbsession)
@@ -1490,7 +1383,8 @@ def add_or_update_image(dbsession, userId, imageId, tags=[], digests=[], anchore
     if not dockerfile and anchore_data:
         a = anchore_data[0]
         try:
-            dockerfile = a['image']['imagedata']['image_report']['dockerfile_contents'].encode('base64')
+            dockerfile = base64.b64encode(a['image']['imagedata']['image_report']['dockerfile_contents'])
+            #dockerfile = a['image']['imagedata']['image_report']['dockerfile_contents'].encode('base64')
             dockerfile_mode = a['image']['imagedata']['image_report']['dockerfile_mode']
         except Exception as err:
             logger.warn("could not extract dockerfile_contents from input anchore_data - exception: " + str(err))
@@ -1518,9 +1412,9 @@ def add_or_update_image(dbsession, userId, imageId, tags=[], digests=[], anchore
                             rc =  archive_sys.put_document(userId, 'analysis_data', imageDigest, anchore_data)
 
                             image_content_data = {}
-                            for content_type in anchore_engine.services.common.image_content_types:
+                            for content_type in anchore_engine.services.common.image_content_types + anchore_engine.services.common.image_metadata_types:
                                 try:
-                                    image_content_data[content_type] = anchore_engine.services.common.extract_analyzer_content(anchore_data, content_type)
+                                    image_content_data[content_type] = anchore_engine.services.common.extract_analyzer_content(anchore_data, content_type, manifest=manifest)
                                 except:
                                     image_content_data[content_type] = {}
                             if image_content_data:

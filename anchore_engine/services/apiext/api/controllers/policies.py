@@ -26,21 +26,21 @@ def make_response_policy(user_auth, policy_record, params):
         latest_ts = 0
         for datekey in ['last_updated', 'created_at']:
             try:
-                update_ts = policy_record[datekey] #datetime.datetime.utcfromtimestamp(policy_record[datekey]).isoformat()
+                update_ts = policy_record[datekey] 
                 if update_ts > latest_ts:
                     latest_ts = update_ts
             except:
                 pass
 
             try:
-                update_ts = policy_record['policybundlemeta'][datekey] #datetime.datetime.utcfromtimestamp(policy_record['policybundlemeta'][datekey]).isoformat()
+                update_ts = policy_record['policybundlemeta'][datekey] 
                 if update_ts > latest_ts:
                     latest_ts = update_ts
             except:
                 pass
 
-        policy_record['created_at'] = datetime.datetime.utcfromtimestamp(policy_record['created_at']).isoformat()
-        policy_record['last_updated'] = datetime.datetime.utcfromtimestamp(latest_ts).isoformat()
+        policy_record['created_at'] = datetime.datetime.utcfromtimestamp(policy_record['created_at']).isoformat() + 'Z'
+        policy_record['last_updated'] = datetime.datetime.utcfromtimestamp(latest_ts).isoformat() + 'Z'
 
         if 'detail' in params and not params['detail']:
             # strip out the detail
@@ -75,7 +75,7 @@ def list_policies(detail=None):
         logger.debug('Listing policies')
 
         try:
-            policy_records = catalog.get_policy(user_auth)
+            policy_records = catalog.list_policies(user_auth)
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
@@ -163,17 +163,15 @@ def get_policy(policyId, detail=None):
         logger.debug('Get policy by bundle Id')
 
         try:
-            policy_records = catalog.get_policy(user_auth, policyId=policyId)
+            policy_record = catalog.get_policy(user_auth, policyId=policyId)
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
 
 
-        if policy_records:
+        if policy_record:
             ret = []
-
-            for policy_record in policy_records:
-                ret.append(make_response_policy(user_auth, policy_record, params))
+            ret.append(make_response_policy(user_auth, policy_record, params))
             return_object = ret
             httpcode = 200
         else:
@@ -214,19 +212,18 @@ def update_policy(bundle, policyId, active=False):
             jsondata['active'] = False
 
         try:
-            policy_records = catalog.get_policy(user_auth, policyId=policyId)
+            policy_record = catalog.get_policy(user_auth, policyId=policyId)
         except Exception as err:
             logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
             raise err
 
-        if policy_records:
-            policy_record = policy_records[0]
+        if policy_record:
             if policy_record['active'] and not jsondata['active']:
                 httpcode = 500
                 raise Exception("cannot deactivate an active policy - can only activate an inactive policy")
             elif policyId != jsondata['policyId']:
                 httpcode = 500
-                raise Exception("policyId in route is different from policyId in payload")
+                raise Exception("policyId in route is different from policyId in payload: {} != {}".format(policyId, jsondata['policyId']))
 
             policy_record.update(jsondata)
             policy_record['policyId'] = policyId
@@ -273,15 +270,14 @@ def delete_policy(policyId):
 
         try:
             try:
-                policy_records = catalog.get_policy(user_auth, policyId=policyId)
+                policy_record = catalog.get_policy(user_auth, policyId=policyId)
             except Exception as err:
                 logger.warn("unable to get policy_records for user (" + str(userId) + ") - exception: " + str(err))
                 raise err
 
-            if not policy_records:
+            if not policy_record:
                 rc = True
             else:
-                policy_record = policy_records[0]
                 if policy_record['active']:
                     httpcode = 500
                     raise Exception(

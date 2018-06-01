@@ -109,7 +109,8 @@ def initializeService(sname, config):
 def registerService(sname, config):
     rc = anchore_engine.services.common.registerService(sname, config, enforce_unique=False)
 
-    service_record = {'hostid': config['host_id'], 'servicename': sname}
+    #service_record = {'hostid': config['host_id'], 'servicename': sname}
+    service_record = anchore_engine.subsys.servicestatus.get_my_service_record()
     anchore_engine.subsys.servicestatus.set_status(service_record, up=True, available=True, update_db=True)
 
     return (rc)
@@ -138,6 +139,8 @@ def perform_analyze(userId, manifest, image_record, registry_creds, layer_cache_
     if driver == 'nodocker':
         return(perform_analyze_nodocker(userId, manifest, image_record, registry_creds, layer_cache_enable=layer_cache_enable))
     else:
+        if not os.path.exists("/usr/bin/anchore"):
+            raise Exception("this build of anchore-engine does not include the local 'anchore' tool which is required for the 'localanchore' analyzer driver.  Please switch your analyzer driver to 'nodocker' mode and restart the service to proceed")
         return(perform_analyze_localanchore(userId, manifest, image_record, registry_creds, layer_cache_enable=layer_cache_enable))
 
 def perform_analyze_nodocker(userId, manifest, image_record, registry_creds, layer_cache_enable=False):
@@ -171,9 +174,9 @@ def perform_analyze_nodocker(userId, manifest, image_record, registry_creds, lay
     logger.info("performing analysis on image: " + str([userId, pullstring, fulltag]))
 
     logger.debug("obtaining anchorelock..." + str(pullstring))
-    with localanchore.get_anchorelock(lockId=pullstring):
+    with localanchore.get_anchorelock(lockId=pullstring, driver='nodocker'):
         logger.debug("obtaining anchorelock successful: " + str(pullstring))
-        analyzed_image_report = localanchore_standalone.analyze_image(userId, registry_manifest, image_record, tmpdir, registry_creds=registry_creds, use_cache_dir=use_cache_dir)
+        analyzed_image_report = localanchore_standalone.analyze_image(userId, registry_manifest, image_record, tmpdir, localconfig, registry_creds=registry_creds, use_cache_dir=use_cache_dir)
         ret_analyze = analyzed_image_report
 
     logger.info("performing analysis on image complete: " + str(pullstring))
@@ -263,7 +266,7 @@ def process_analyzer_job(system_user_auth, qobj, layer_cache_enable):
 
     timer = int(time.time())
     try:
-        logger.info('QObj: {}'.format(qobj))
+        logger.debug('dequeued object: {}'.format(qobj))
 
         record = qobj['data']
         userId = record['userId']
@@ -326,9 +329,9 @@ def process_analyzer_job(system_user_auth, qobj, layer_cache_enable):
                 try:
                     logger.debug("extracting image content data")
                     image_content_data = {}
-                    for content_type in anchore_engine.services.common.image_content_types:
+                    for content_type in anchore_engine.services.common.image_content_types + anchore_engine.services.common.image_metadata_types:
                         try:
-                            image_content_data[content_type] = anchore_engine.services.common.extract_analyzer_content(image_data, content_type)
+                            image_content_data[content_type] = anchore_engine.services.common.extract_analyzer_content(image_data, content_type, manifest=manifest)
                         except:
                             image_content_data[content_type] = {}
 
@@ -377,6 +380,7 @@ def process_analyzer_job(system_user_auth, qobj, layer_cache_enable):
                 
                 last_analysis_status = image_record['analysis_status']
                 image_record['analysis_status'] = anchore_engine.subsys.taskstate.complete_state('analyze')
+                image_record['analyzed_at'] = int(time.time())
                 rc = catalog.update_image(user_auth, imageDigest, image_record)
 
                 try:
